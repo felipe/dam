@@ -1,10 +1,14 @@
 import Foundation
 import SQLite3
 
+private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
 /// Tracks imported assets - shares SQLite DB with Python code
+/// Thread-safe via serial dispatch queue
 class Tracker {
     private var db: OpaquePointer?
     private let dbPath: URL
+    private let queue = DispatchQueue(label: "tracker.db.queue")
     
     init(dbPath: URL) throws {
         self.dbPath = dbPath
@@ -12,6 +16,10 @@ class Tracker {
         if sqlite3_open(dbPath.path, &db) != SQLITE_OK {
             throw TrackerError.openFailed(String(cString: sqlite3_errmsg(db)))
         }
+        
+        // Enable WAL mode for better concurrent read performance
+        var errMsg: UnsafeMutablePointer<CChar>?
+        sqlite3_exec(db, "PRAGMA journal_mode=WAL", nil, nil, &errMsg)
         
         try createTables()
     }
@@ -83,30 +91,32 @@ class Tracker {
         fileSize: Int64,
         mediaType: String
     ) throws {
-        let sql = """
-            INSERT OR REPLACE INTO imported_assets 
-            (icloud_uuid, immich_id, filename, file_size, media_type, imported_at)
-            VALUES (?, ?, ?, ?, ?, datetime('now'))
-        """
-        var stmt: OpaquePointer?
-        
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw TrackerError.prepareFailed(String(cString: sqlite3_errmsg(db)))
-        }
-        defer { sqlite3_finalize(stmt) }
-        
-        sqlite3_bind_text(stmt, 1, uuid, -1, nil)
-        if let immichID = immichID {
-            sqlite3_bind_text(stmt, 2, immichID, -1, nil)
-        } else {
-            sqlite3_bind_null(stmt, 2)
-        }
-        sqlite3_bind_text(stmt, 3, filename, -1, nil)
-        sqlite3_bind_int64(stmt, 4, fileSize)
-        sqlite3_bind_text(stmt, 5, mediaType, -1, nil)
-        
-        if sqlite3_step(stmt) != SQLITE_DONE {
-            throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
+        try queue.sync {
+            let sql = """
+                INSERT OR REPLACE INTO imported_assets 
+                (icloud_uuid, immich_id, filename, file_size, media_type, imported_at)
+                VALUES (?, ?, ?, ?, ?, datetime('now'))
+            """
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw TrackerError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
+            if let immichID = immichID {
+                sqlite3_bind_text(stmt, 2, immichID, -1, SQLITE_TRANSIENT)
+            } else {
+                sqlite3_bind_null(stmt, 2)
+            }
+            sqlite3_bind_text(stmt, 3, filename, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int64(stmt, 4, fileSize)
+            sqlite3_bind_text(stmt, 5, mediaType, -1, SQLITE_TRANSIENT)
+            
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
+            }
         }
     }
     

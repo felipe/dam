@@ -156,6 +156,85 @@ class ImmichClient {
         return assetIDs
     }
     
+    struct AssetInfo {
+        let id: String
+        let deviceAssetId: String
+        let originalFileName: String
+        let type: String  // IMAGE or VIDEO
+        let fileSize: Int64
+    }
+    
+    /// Get all assets from Immich with metadata (for syncing tracker)
+    func getAllAssets(deviceId: String? = "photos-sync", progress: ((Int) -> Void)? = nil) async -> [AssetInfo] {
+        var assets: [AssetInfo] = []
+        var page = 1
+        let pageSize = 250  // Immich caps at 250 per page
+        
+        while true {
+            guard let url = URL(string: "\(baseURL)/api/search/metadata") else { break }
+            
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            
+            var body: [String: Any] = [
+                "take": pageSize,
+                "page": page
+            ]
+            if let deviceId = deviceId {
+                body["deviceId"] = deviceId
+            }
+            request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            
+            do {
+                let (data, _) = try await session.data(for: request)
+                guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let assetsData = json["assets"] as? [String: Any],
+                      let items = assetsData["items"] as? [[String: Any]] else { break }
+                
+                if items.isEmpty { break }
+                
+                for item in items {
+                    if let id = item["id"] as? String,
+                       let deviceAssetId = item["deviceAssetId"] as? String {
+                        let filename = item["originalFileName"] as? String ?? ""
+                        let type = item["type"] as? String ?? "IMAGE"
+                        assets.append(AssetInfo(
+                            id: id,
+                            deviceAssetId: deviceAssetId,
+                            originalFileName: filename,
+                            type: type,
+                            fileSize: 0
+                        ))
+                    }
+                }
+                
+                progress?(assets.count)
+                
+                // Check if there's a next page (can be Int or String)
+                let hasNextPage: Bool
+                if let nextInt = assetsData["nextPage"] as? Int {
+                    hasNextPage = true
+                    _ = nextInt  // silence unused warning
+                } else if let nextStr = assetsData["nextPage"] as? String, !nextStr.isEmpty {
+                    hasNextPage = true
+                } else {
+                    hasNextPage = assetsData["nextPage"] != nil && !(assetsData["nextPage"] is NSNull)
+                }
+                
+                if !hasNextPage {
+                    break
+                }
+                page += 1
+            } catch {
+                break
+            }
+        }
+        
+        return assets
+    }
+    
     /// Check if an asset exists in Immich by device asset ID
     func assetExists(deviceAssetID: String) async -> Bool {
         // Use search endpoint
