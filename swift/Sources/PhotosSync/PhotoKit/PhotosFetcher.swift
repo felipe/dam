@@ -69,7 +69,18 @@ class PhotosFetcher {
         fetchResult.enumerateObjects { asset, _, _ in
             let resources = PHAssetResource.assetResources(for: asset)
             let originalResource = resources.first { $0.type == .photo || $0.type == .video }
-            let filename = originalResource?.originalFilename ?? "unknown"
+            var filename = originalResource?.originalFilename ?? ""
+            
+            // Fallback filename if empty
+            if filename.isEmpty {
+                let ext: String
+                switch asset.mediaType {
+                case .image: ext = "jpg"
+                case .video: ext = "mov"
+                default: ext = "dat"
+                }
+                filename = "\(asset.localIdentifier.replacingOccurrences(of: "/", with: "_")).\(ext)"
+            }
             
             assets.append(AssetInfo(
                 localIdentifier: asset.localIdentifier,
@@ -140,7 +151,8 @@ class PhotosFetcher {
     static func downloadAsset(
         identifier: String,
         to stagingDir: URL,
-        timeout: TimeInterval = 300
+        timeout: TimeInterval = 300,
+        allowNetwork: Bool = true
     ) async -> DownloadResult {
         // Fetch the asset
         let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
@@ -169,7 +181,17 @@ class PhotosFetcher {
             )
         }
         
-        let filename = resource.originalFilename
+        // Get filename, fallback to UUID + extension if empty
+        var filename = resource.originalFilename
+        if filename.isEmpty {
+            let ext: String
+            switch asset.mediaType {
+            case .image: ext = "jpg"
+            case .video: ext = "mov"
+            default: ext = "dat"
+            }
+            filename = "\(identifier.replacingOccurrences(of: "/", with: "_")).\(ext)"
+        }
         let destURL = stagingDir.appendingPathComponent(filename)
         
         // Remove existing file if present
@@ -177,7 +199,7 @@ class PhotosFetcher {
         
         return await withCheckedContinuation { continuation in
             let options = PHAssetResourceRequestOptions()
-            options.isNetworkAccessAllowed = true  // Allow iCloud download
+            options.isNetworkAccessAllowed = allowNetwork
             
             // Set up timeout
             var completed = false

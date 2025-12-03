@@ -14,6 +14,9 @@ struct ImportCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Include photos that need to be downloaded from iCloud")
     var includeCloud: Bool = false
     
+    @Flag(name: .long, help: "Skip slow local availability check, fail fast on cloud-only assets")
+    var skipLocalCheck: Bool = false
+    
     @Option(name: .long, help: "Maximum number of photos to process (0 = unlimited)")
     var limit: Int = 0
     
@@ -64,7 +67,18 @@ struct ImportCommand: AsyncParsableCommand {
         
         // Filter by local/cloud if needed
         var toImport: [PhotosFetcher.AssetInfo] = []
-        if !includeCloud {
+        if includeCloud || skipLocalCheck {
+            // Skip the slow local check - just import everything
+            // With skipLocalCheck, cloud-only assets will fail fast during download
+            if skipLocalCheck && !includeCloud {
+                print("Skipping local availability check (will fail fast on cloud-only assets)")
+            }
+            toImport = candidates
+            // Apply limit
+            if limit > 0 && toImport.count > limit {
+                toImport = Array(toImport.prefix(limit))
+            }
+        } else {
             print("Checking which assets are locally available...")
             var cloudSkipped = 0
             for (idx, asset) in candidates.enumerated() {
@@ -87,12 +101,6 @@ struct ImportCommand: AsyncParsableCommand {
             }
             if cloudSkipped > 0 {
                 print("Skipping \(formatNumber(cloudSkipped)) assets in iCloud (use --include-cloud to download)")
-            }
-        } else {
-            toImport = candidates
-            // Apply limit
-            if limit > 0 && toImport.count > limit {
-                toImport = Array(toImport.prefix(limit))
             }
         }
         
@@ -123,7 +131,8 @@ struct ImportCommand: AsyncParsableCommand {
                     immich: immich,
                     tracker: tracker,
                     stats: stats,
-                    dryRun: dryRun
+                    dryRun: dryRun,
+                    allowNetwork: includeCloud
                 )
                 
                 // Delay between iCloud downloads
@@ -154,7 +163,8 @@ struct ImportCommand: AsyncParsableCommand {
                                 immich: immich,
                                 tracker: tracker,
                                 stats: stats,
-                                dryRun: self.dryRun
+                                dryRun: self.dryRun,
+                                allowNetwork: self.includeCloud
                             )
                             
                             // Small delay per task to be gentle on iCloud
@@ -201,7 +211,8 @@ struct ImportCommand: AsyncParsableCommand {
         immich: ImmichClient,
         tracker: Tracker,
         stats: ImportStatsActor,
-        dryRun: Bool
+        dryRun: Bool,
+        allowNetwork: Bool
     ) async {
         let num = index + 1
         print("[\(num)/\(total)] \(asset.filename)")
@@ -212,15 +223,17 @@ struct ImportCommand: AsyncParsableCommand {
             return
         }
         
-        // Download the asset - use unique filename to avoid conflicts
-        let isCloud = !asset.isLocal
-        if isCloud {
+        // Export/download the asset
+        if allowNetwork {
             print("  Downloading from iCloud...")
+        } else {
+            print("  Exporting...")
         }
         
         let downloadResult = await PhotosFetcher.downloadAsset(
             identifier: asset.localIdentifier,
-            to: config.stagingDir
+            to: config.stagingDir,
+            allowNetwork: allowNetwork
         )
         
         if !downloadResult.success {
