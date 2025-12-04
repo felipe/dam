@@ -1,26 +1,26 @@
 import Foundation
 
 /// Client for Immich API
-class ImmichClient {
+public final class ImmichClient: Sendable {
     private let baseURL: String
     private let apiKey: String
     private let session: URLSession
     
-    struct UploadResult {
-        let success: Bool
-        let assetID: String?
-        let duplicate: Bool
-        let error: String?
+    public struct UploadResult: Sendable {
+        public let success: Bool
+        public let assetID: String?
+        public let duplicate: Bool
+        public let error: String?
     }
     
-    init(baseURL: String, apiKey: String) {
+    public init(baseURL: String, apiKey: String) {
         self.baseURL = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
         self.apiKey = apiKey
         self.session = URLSession.shared
     }
     
     /// Test connection to Immich
-    func ping() async -> Bool {
+    public func ping() async -> Bool {
         guard let url = URL(string: "\(baseURL)/api/server/ping") else { return false }
         
         var request = URLRequest(url: url)
@@ -35,7 +35,7 @@ class ImmichClient {
     }
     
     /// Upload an asset to Immich
-    func uploadAsset(
+    public func uploadAsset(
         fileURL: URL,
         deviceAssetID: String,
         deviceID: String = "photos-sync",
@@ -123,7 +123,7 @@ class ImmichClient {
     }
     
     /// Get all asset IDs from Immich (for cleanup comparison)
-    func getAllAssetIDs() async -> Set<String> {
+    public func getAllAssetIDs() async -> Set<String> {
         var assetIDs = Set<String>()
         var page = 1
         let pageSize = 1000
@@ -156,16 +156,16 @@ class ImmichClient {
         return assetIDs
     }
     
-    struct AssetInfo {
-        let id: String
-        let deviceAssetId: String
-        let originalFileName: String
-        let type: String  // IMAGE or VIDEO
-        let fileSize: Int64
+    public struct AssetInfo: Sendable {
+        public let id: String
+        public let deviceAssetId: String
+        public let originalFileName: String
+        public let type: String  // IMAGE or VIDEO
+        public let fileSize: Int64
     }
     
     /// Get all assets from Immich with metadata (for syncing tracker)
-    func getAllAssets(deviceId: String? = "photos-sync", progress: ((Int) -> Void)? = nil) async -> [AssetInfo] {
+    public func getAllAssets(deviceId: String? = "photos-sync", progress: ((Int) -> Void)? = nil) async -> [AssetInfo] {
         var assets: [AssetInfo] = []
         var page = 1
         let pageSize = 250  // Immich caps at 250 per page
@@ -236,7 +236,7 @@ class ImmichClient {
     }
     
     /// Check if an asset exists in Immich by device asset ID
-    func assetExists(deviceAssetID: String) async -> Bool {
+    public func assetExists(deviceAssetID: String) async -> Bool {
         // Use search endpoint
         guard let url = URL(string: "\(baseURL)/api/search/metadata") else { return false }
         
@@ -264,7 +264,7 @@ class ImmichClient {
     }
     
     /// Archive assets in Immich (hide them without deleting)
-    func archiveAssets(ids: [String]) async -> Bool {
+    public func archiveAssets(ids: [String]) async -> Bool {
         guard let url = URL(string: "\(baseURL)/api/assets") else { return false }
         
         var request = URLRequest(url: url)
@@ -287,7 +287,7 @@ class ImmichClient {
     }
     
     /// Get asset info by ID
-    func getAsset(id: String) async -> [String: Any]? {
+    public func getAsset(id: String) async -> [String: Any]? {
         guard let url = URL(string: "\(baseURL)/api/assets/\(id)") else { return nil }
         
         var request = URLRequest(url: url)

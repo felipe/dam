@@ -5,12 +5,12 @@ private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.sel
 
 /// Tracks imported assets - shares SQLite DB with Python code
 /// Thread-safe via serial dispatch queue
-class Tracker {
+public final class Tracker: @unchecked Sendable {
     private var db: OpaquePointer?
     private let dbPath: URL
     private let queue = DispatchQueue(label: "tracker.db.queue")
     
-    init(dbPath: URL) throws {
+    public init(dbPath: URL) throws {
         self.dbPath = dbPath
         
         if sqlite3_open(dbPath.path, &db) != SQLITE_OK {
@@ -54,39 +54,43 @@ class Tracker {
         }
     }
     
-    func isImported(uuid: String) -> Bool {
-        let sql = "SELECT 1 FROM imported_assets WHERE icloud_uuid = ? LIMIT 1"
-        var stmt: OpaquePointer?
-        
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            return false
+    public func isImported(uuid: String) -> Bool {
+        queue.sync {
+            let sql = "SELECT 1 FROM imported_assets WHERE icloud_uuid = ? LIMIT 1"
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return false
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
+            return sqlite3_step(stmt) == SQLITE_ROW
         }
-        defer { sqlite3_finalize(stmt) }
-        
-        sqlite3_bind_text(stmt, 1, uuid, -1, nil)
-        return sqlite3_step(stmt) == SQLITE_ROW
     }
     
-    func getImportedUUIDs() -> Set<String> {
-        var uuids = Set<String>()
-        let sql = "SELECT icloud_uuid FROM imported_assets"
-        var stmt: OpaquePointer?
-        
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+    public func getImportedUUIDs() -> Set<String> {
+        queue.sync {
+            var uuids = Set<String>()
+            let sql = "SELECT icloud_uuid FROM imported_assets"
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return uuids
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                if let cString = sqlite3_column_text(stmt, 0) {
+                    uuids.insert(String(cString: cString))
+                }
+            }
+            
             return uuids
         }
-        defer { sqlite3_finalize(stmt) }
-        
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let cString = sqlite3_column_text(stmt, 0) {
-                uuids.insert(String(cString: cString))
-            }
-        }
-        
-        return uuids
     }
     
-    func markImported(
+    public func markImported(
         uuid: String,
         immichID: String?,
         filename: String,
@@ -122,7 +126,7 @@ class Tracker {
         }
     }
     
-    func getStats() -> (total: Int, photos: Int, videos: Int, totalBytes: Int64) {
+    public func getStats() -> (total: Int, photos: Int, videos: Int, totalBytes: Int64) {
         var total = 0
         var photos = 0
         var videos = 0
@@ -151,47 +155,53 @@ class Tracker {
         return (total, photos, videos, totalBytes)
     }
     
-    func getImmichIDForUUID(_ uuid: String) -> String? {
-        let sql = "SELECT immich_id FROM imported_assets WHERE icloud_uuid = ?"
-        var stmt: OpaquePointer?
-        
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+    public func getImmichIDForUUID(_ uuid: String) -> String? {
+        queue.sync {
+            let sql = "SELECT immich_id FROM imported_assets WHERE icloud_uuid = ?"
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return nil
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
+            
+            if sqlite3_step(stmt) == SQLITE_ROW, let cString = sqlite3_column_text(stmt, 0) {
+                return String(cString: cString)
+            }
             return nil
         }
-        defer { sqlite3_finalize(stmt) }
-        
-        sqlite3_bind_text(stmt, 1, uuid, -1, nil)
-        
-        if sqlite3_step(stmt) == SQLITE_ROW, let cString = sqlite3_column_text(stmt, 0) {
-            return String(cString: cString)
-        }
-        return nil
     }
     
     private func querySingleInt(_ sql: String) -> Int? {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
-        defer { sqlite3_finalize(stmt) }
-        
-        if sqlite3_step(stmt) == SQLITE_ROW {
-            return Int(sqlite3_column_int(stmt, 0))
+        queue.sync {
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                return Int(sqlite3_column_int(stmt, 0))
+            }
+            return nil
         }
-        return nil
     }
     
     private func querySingleInt64(_ sql: String) -> Int64? {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
-        defer { sqlite3_finalize(stmt) }
-        
-        if sqlite3_step(stmt) == SQLITE_ROW {
-            return sqlite3_column_int64(stmt, 0)
+        queue.sync {
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                return sqlite3_column_int64(stmt, 0)
+            }
+            return nil
         }
-        return nil
     }
     
     /// Mark an asset as archived (deleted from Photos, kept in Immich)
-    func markArchived(uuid: String) throws {
+    public func markArchived(uuid: String) throws {
         try queue.sync {
             let sql = "UPDATE imported_assets SET archived = 1 WHERE icloud_uuid = ?"
             var stmt: OpaquePointer?
@@ -210,45 +220,49 @@ class Tracker {
     }
     
     /// Check if an asset is archived
-    func isArchived(uuid: String) -> Bool {
-        let sql = "SELECT archived FROM imported_assets WHERE icloud_uuid = ? LIMIT 1"
-        var stmt: OpaquePointer?
-        
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+    public func isArchived(uuid: String) -> Bool {
+        queue.sync {
+            let sql = "SELECT archived FROM imported_assets WHERE icloud_uuid = ? LIMIT 1"
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return false
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
+            
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                return sqlite3_column_int(stmt, 0) == 1
+            }
             return false
         }
-        defer { sqlite3_finalize(stmt) }
-        
-        sqlite3_bind_text(stmt, 1, uuid, -1, nil)
-        
-        if sqlite3_step(stmt) == SQLITE_ROW {
-            return sqlite3_column_int(stmt, 0) == 1
-        }
-        return false
     }
     
     /// Get all non-archived imported UUIDs (for import comparison)
-    func getActiveImportedUUIDs() -> Set<String> {
-        var uuids = Set<String>()
-        let sql = "SELECT icloud_uuid FROM imported_assets WHERE archived = 0 OR archived IS NULL"
-        var stmt: OpaquePointer?
-        
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+    public func getActiveImportedUUIDs() -> Set<String> {
+        queue.sync {
+            var uuids = Set<String>()
+            let sql = "SELECT icloud_uuid FROM imported_assets WHERE archived = 0 OR archived IS NULL"
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return uuids
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                if let cString = sqlite3_column_text(stmt, 0) {
+                    uuids.insert(String(cString: cString))
+                }
+            }
+            
             return uuids
         }
-        defer { sqlite3_finalize(stmt) }
-        
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let cString = sqlite3_column_text(stmt, 0) {
-                uuids.insert(String(cString: cString))
-            }
-        }
-        
-        return uuids
     }
     
     /// Remove an asset from tracking (when deleted from both Photos and Immich)
-    func removeAsset(uuid: String) throws {
+    public func removeAsset(uuid: String) throws {
         try queue.sync {
             let sql = "DELETE FROM imported_assets WHERE icloud_uuid = ?"
             var stmt: OpaquePointer?
@@ -267,7 +281,7 @@ class Tracker {
     }
 }
 
-enum TrackerError: Error {
+public enum TrackerError: Error {
     case openFailed(String)
     case prepareFailed(String)
     case execFailed(String)

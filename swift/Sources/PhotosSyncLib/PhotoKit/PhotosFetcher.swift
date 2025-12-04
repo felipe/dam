@@ -1,53 +1,45 @@
-import Foundation
+@preconcurrency import Foundation
+@preconcurrency import Dispatch
 import Photos
 
 /// Fetches and downloads photos from the Photos library via PhotoKit
-class PhotosFetcher {
+public final class PhotosFetcher: Sendable {
     
-    struct AssetInfo {
-        let localIdentifier: String
-        let filename: String
-        let mediaType: PHAssetMediaType
-        let creationDate: Date?
-        let modificationDate: Date?
-        let isLocal: Bool  // Original is available locally
+    public struct AssetInfo: Sendable {
+        public let localIdentifier: String
+        public let filename: String
+        public let mediaType: PHAssetMediaType
+        public let creationDate: Date?
+        public let modificationDate: Date?
+        public let isLocal: Bool  // Original is available locally
     }
     
-    struct DownloadResult {
-        let localIdentifier: String
-        let filename: String
-        let fileURL: URL?
-        let fileSize: Int64
-        let mediaType: String
-        let error: String?
+    public struct DownloadResult: Sendable {
+        public let localIdentifier: String
+        public let filename: String
+        public let fileURL: URL?
+        public let fileSize: Int64
+        public let mediaType: String
+        public let error: String?
         
-        var success: Bool { fileURL != nil }
+        public var success: Bool { fileURL != nil }
     }
     
     /// Request Photos library access
-    static func requestAccess() async -> Bool {
+    public static func requestAccess() async -> Bool {
         let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         
         switch status {
         case .authorized, .limited:
             return true
         case .notDetermined:
-            // Use semaphore for CLI compatibility
-            var granted = false
-            let semaphore = DispatchSemaphore(value: 0)
-            
-            PHPhotoLibrary.requestAuthorization(for: .readWrite) { newStatus in
-                granted = (newStatus == .authorized || newStatus == .limited)
-                semaphore.signal()
+            // Use withCheckedContinuation for proper async handling
+            let newStatus = await withCheckedContinuation { continuation in
+                PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
+                    continuation.resume(returning: status)
+                }
             }
-            
-            // Wait up to 60 seconds for user to respond to permission dialog
-            let result = semaphore.wait(timeout: .now() + 60)
-            if result == .timedOut {
-                print("Permission request timed out. Please grant Photos access in System Settings.")
-                return false
-            }
-            return granted
+            return newStatus == .authorized || newStatus == .limited
         case .denied, .restricted:
             print("Photos access denied. Grant access in System Settings → Privacy & Security → Photos")
             return false
@@ -57,7 +49,7 @@ class PhotosFetcher {
     }
     
     /// Get all assets from the library (fast - doesn't check local status)
-    static func getAllAssets() -> [AssetInfo] {
+    public static func getAllAssets() -> [AssetInfo] {
         var assets: [AssetInfo] = []
         
         let fetchOptions = PHFetchOptions()
@@ -96,7 +88,7 @@ class PhotosFetcher {
     }
     
     /// Check if an asset is available locally (synchronous)
-    static func isAssetLocal(_ identifier: String) -> Bool {
+    public static func isAssetLocal(_ identifier: String) -> Bool {
         let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
         guard let asset = fetchResult.firstObject else { return false }
         
@@ -124,7 +116,7 @@ class PhotosFetcher {
     }
     
     /// Get count of locally available assets (samples for speed)
-    static func countLocalAssets(sampleSize: Int = 100) -> (local: Int, total: Int, estimated: Int) {
+    public static func countLocalAssets(sampleSize: Int = 100) -> (local: Int, total: Int, estimated: Int) {
         let allAssets = getAllAssets()
         let total = allAssets.count
         
@@ -148,7 +140,7 @@ class PhotosFetcher {
     }
     
     /// Download original asset to staging directory
-    static func downloadAsset(
+    public static func downloadAsset(
         identifier: String,
         to stagingDir: URL,
         timeout: TimeInterval = 300,
@@ -197,24 +189,40 @@ class PhotosFetcher {
         // Remove existing file if present
         try? FileManager.default.removeItem(at: destURL)
         
+        // Capture values to avoid mutable variable issues in closures
+        let finalFilename = filename
+        let mediaType = mediaTypeString(asset.mediaType)
+        
         return await withCheckedContinuation { continuation in
             let options = PHAssetResourceRequestOptions()
             options.isNetworkAccessAllowed = allowNetwork
             
-            // Set up timeout
-            var completed = false
-            let timeoutWork = DispatchWorkItem {
-                if !completed {
+            // Use a class to safely track completion state across closures
+            final class CompletionState: @unchecked Sendable {
+                var completed = false
+                let lock = NSLock()
+                
+                func tryComplete() -> Bool {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    if completed { return false }
                     completed = true
-                    continuation.resume(returning: DownloadResult(
-                        localIdentifier: identifier,
-                        filename: filename,
-                        fileURL: nil,
-                        fileSize: 0,
-                        mediaType: mediaTypeString(asset.mediaType),
-                        error: "Download timed out after \(Int(timeout))s"
-                    ))
+                    return true
                 }
+            }
+            let state = CompletionState()
+            
+            // Set up timeout
+            let timeoutWork = DispatchWorkItem { [state] in
+                guard state.tryComplete() else { return }
+                continuation.resume(returning: DownloadResult(
+                    localIdentifier: identifier,
+                    filename: finalFilename,
+                    fileURL: nil,
+                    fileSize: 0,
+                    mediaType: mediaType,
+                    error: "Download timed out after \(Int(timeout))s"
+                ))
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: timeoutWork)
             
@@ -222,29 +230,28 @@ class PhotosFetcher {
                 for: resource,
                 toFile: destURL,
                 options: options
-            ) { error in
+            ) { [state] error in
                 timeoutWork.cancel()
                 
-                guard !completed else { return }
-                completed = true
+                guard state.tryComplete() else { return }
                 
                 if let error = error {
                     continuation.resume(returning: DownloadResult(
                         localIdentifier: identifier,
-                        filename: filename,
+                        filename: finalFilename,
                         fileURL: nil,
                         fileSize: 0,
-                        mediaType: mediaTypeString(asset.mediaType),
+                        mediaType: mediaType,
                         error: error.localizedDescription
                     ))
                 } else {
                     let fileSize = (try? FileManager.default.attributesOfItem(atPath: destURL.path)[.size] as? Int64) ?? 0
                     continuation.resume(returning: DownloadResult(
                         localIdentifier: identifier,
-                        filename: filename,
+                        filename: finalFilename,
                         fileURL: destURL,
                         fileSize: fileSize,
-                        mediaType: mediaTypeString(asset.mediaType),
+                        mediaType: mediaType,
                         error: nil
                     ))
                 }
@@ -253,7 +260,7 @@ class PhotosFetcher {
     }
     
     /// Get asset creation/modification dates
-    static func getAssetDates(identifier: String) -> (created: Date?, modified: Date?) {
+    public static func getAssetDates(identifier: String) -> (created: Date?, modified: Date?) {
         let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
         guard let asset = fetchResult.firstObject else {
             return (nil, nil)

@@ -1,18 +1,18 @@
 import Foundation
 
-struct Config {
-    let immichURL: String
-    let immichAPIKey: String
-    let stagingDir: URL
-    let dataDir: URL
-    let batchSize: Int
-    let dryRun: Bool
+public struct Config: Sendable {
+    public let immichURL: String
+    public let immichAPIKey: String
+    public let stagingDir: URL
+    public let dataDir: URL
+    public let batchSize: Int
+    public let dryRun: Bool
     
-    var trackerDBPath: URL {
+    public var trackerDBPath: URL {
         dataDir.appendingPathComponent("tracker.db")
     }
     
-    static func load(dryRun: Bool = false, batchSize: Int = 100) -> Config? {
+    public static func load(dryRun: Bool = false, batchSize: Int = 100) -> Config? {
         // Find .env file - look in dam directory
         let damDir = findDAMDirectory()
         let envPath = damDir.appendingPathComponent(".env")

@@ -1,3 +1,4 @@
+import PhotosSyncLib
 import ArgumentParser
 import Foundation
 
