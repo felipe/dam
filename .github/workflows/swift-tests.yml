@@ -1,0 +1,41 @@
+name: Swift Tests
+
+on:
+  push:
+    branches: [main, feature/*]
+    paths:
+      - 'swift/**'
+      - '.github/workflows/swift-tests.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'swift/**'
+
+jobs:
+  test:
+    runs-on: macos-15
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Select Xcode 26 (Swift 6)
+        run: sudo xcode-select -s /Applications/Xcode_26.1.1.app/Contents/Developer
+      
+      - name: Swift version
+        run: swift --version
+      
+      - name: Build
+        working-directory: swift
+        run: swift build
+      
+      - name: Run tests
+        working-directory: swift
+        run: swift test --enable-code-coverage
+      
+      - name: Generate coverage report
+        working-directory: swift
+        run: |
+          xcrun llvm-cov report \
+            .build/debug/PhotosSyncPackageTests.xctest/Contents/MacOS/PhotosSyncPackageTests \
+            --instr-profile .build/debug/codecov/default.profdata \
+            --sources Sources/PhotosSyncLib/
