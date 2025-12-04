@@ -2,17 +2,17 @@ import Foundation
 import Photos
 
 /// Deletes photos from the Photos library
-class PhotosDeleter {
+public final class PhotosDeleter: Sendable {
     
-    struct DeleteResult {
-        let localIdentifier: String
-        let success: Bool
-        let error: String?
+    public struct DeleteResult: Sendable {
+        public let localIdentifier: String
+        public let success: Bool
+        public let error: String?
     }
     
     /// Delete assets by local identifier
     /// Note: This moves them to "Recently Deleted" - they're not permanently gone for 30 days
-    static func deleteAssets(identifiers: [String], dryRun: Bool = false) async -> [DeleteResult] {
+    public static func deleteAssets(identifiers: [String], dryRun: Bool = false) async -> [DeleteResult] {
         if dryRun {
             return identifiers.map { DeleteResult(localIdentifier: $0, success: true, error: nil) }
         }
@@ -40,7 +40,7 @@ class PhotosDeleter {
     }
     
     /// Delete a single asset
-    static func deleteAsset(identifier: String, dryRun: Bool = false) async -> DeleteResult {
+    public static func deleteAsset(identifier: String, dryRun: Bool = false) async -> DeleteResult {
         let results = await deleteAssets(identifiers: [identifier], dryRun: dryRun)
         return results.first ?? DeleteResult(localIdentifier: identifier, success: false, error: "Unknown error")
     }

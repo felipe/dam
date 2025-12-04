@@ -1,3 +1,4 @@
+import PhotosSyncLib
 import ArgumentParser
 import Foundation
 import Photos
@@ -14,11 +15,14 @@ struct ImportCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Include photos that need to be downloaded from iCloud")
     var includeCloud: Bool = false
     
+    @Flag(name: .long, help: "Skip slow local availability check, fail fast on cloud-only assets")
+    var skipLocalCheck: Bool = false
+    
     @Option(name: .long, help: "Maximum number of photos to process (0 = unlimited)")
     var limit: Int = 0
     
-    @Option(name: .long, help: "Number of concurrent downloads")
-    var concurrency: Int = 3
+    @Option(name: .long, help: "Number of concurrent imports")
+    var concurrency: Int = 1
     
     @Option(name: .long, help: "Delay between iCloud downloads in seconds")
     var delay: Double = 5.0
@@ -59,12 +63,23 @@ struct ImportCommand: AsyncParsableCommand {
         print("Total assets in library: \(formatNumber(allAssets.count))")
         
         // Filter to not-yet-imported
-        var candidates = allAssets.filter { !importedUUIDs.contains($0.localIdentifier) }
+        let candidates = allAssets.filter { !importedUUIDs.contains($0.localIdentifier) }
         print("Not yet imported: \(formatNumber(candidates.count))")
         
         // Filter by local/cloud if needed
         var toImport: [PhotosFetcher.AssetInfo] = []
-        if !includeCloud {
+        if includeCloud || skipLocalCheck {
+            // Skip the slow local check - just import everything
+            // With skipLocalCheck, cloud-only assets will fail fast during download
+            if skipLocalCheck && !includeCloud {
+                print("Skipping local availability check (will fail fast on cloud-only assets)")
+            }
+            toImport = candidates
+            // Apply limit
+            if limit > 0 && toImport.count > limit {
+                toImport = Array(toImport.prefix(limit))
+            }
+        } else {
             print("Checking which assets are locally available...")
             var cloudSkipped = 0
             for (idx, asset) in candidates.enumerated() {
@@ -88,12 +103,6 @@ struct ImportCommand: AsyncParsableCommand {
             if cloudSkipped > 0 {
                 print("Skipping \(formatNumber(cloudSkipped)) assets in iCloud (use --include-cloud to download)")
             }
-        } else {
-            toImport = candidates
-            // Apply limit
-            if limit > 0 && toImport.count > limit {
-                toImport = Array(toImport.prefix(limit))
-            }
         }
         
         print("Assets to import: \(formatNumber(toImport.count))")
@@ -105,107 +114,179 @@ struct ImportCommand: AsyncParsableCommand {
         
         print()
         print(String(repeating: "=", count: 50))
-        print("IMPORTING \(formatNumber(toImport.count)) ASSETS")
+        print("IMPORTING \(formatNumber(toImport.count)) ASSETS (concurrency: \(concurrency))")
         print(String(repeating: "=", count: 50))
         print()
         
-        var stats = ImportStats()
+        let stats = ImportStatsActor()
+        let totalCount = toImport.count
         
-        for (index, asset) in toImport.enumerated() {
-            let num = index + 1
-            print("[\(num)/\(toImport.count)] \(asset.filename)")
-            
-            if dryRun {
-                print("  DRY RUN: Would download and upload")
-                stats.skipped += 1
-                continue
+        if concurrency <= 1 {
+            // Sequential processing (original behavior)
+            for (index, asset) in toImport.enumerated() {
+                await processAsset(
+                    asset: asset,
+                    index: index,
+                    total: totalCount,
+                    config: config,
+                    immich: immich,
+                    tracker: tracker,
+                    stats: stats,
+                    dryRun: dryRun,
+                    allowNetwork: includeCloud
+                )
+                
+                // Delay between iCloud downloads
+                if index < toImport.count - 1 && delay > 0 {
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                }
             }
-            
-            // Download the asset
-            let isCloud = !asset.isLocal
-            if isCloud {
-                print("  Downloading from iCloud...")
-            }
-            
-            let downloadResult = await PhotosFetcher.downloadAsset(
-                identifier: asset.localIdentifier,
-                to: config.stagingDir
-            )
-            
-            if !downloadResult.success {
-                print("  ERROR: \(downloadResult.error ?? "Download failed")")
-                stats.failed += 1
-                continue
-            }
-            
-            guard let fileURL = downloadResult.fileURL else {
-                print("  ERROR: No file URL")
-                stats.failed += 1
-                continue
-            }
-            
-            stats.exported += 1
-            print("  Exported: \(formatBytes(downloadResult.fileSize))")
-            
-            // Get dates
-            let dates = PhotosFetcher.getAssetDates(identifier: asset.localIdentifier)
-            
-            // Upload to Immich
-            let uploadResult = await immich.uploadAsset(
-                fileURL: fileURL,
-                deviceAssetID: asset.localIdentifier,
-                fileCreatedAt: dates.created,
-                fileModifiedAt: dates.modified
-            )
-            
-            // Clean up staging file
-            try? FileManager.default.removeItem(at: fileURL)
-            
-            if uploadResult.success {
-                if uploadResult.duplicate {
-                    print("  Duplicate in Immich")
-                    stats.duplicates += 1
-                } else {
-                    print("  Uploaded: \(uploadResult.assetID ?? "unknown")")
-                    stats.uploaded += 1
+        } else {
+            // Concurrent processing
+            await withTaskGroup(of: Void.self) { group in
+                var inFlight = 0
+                var nextIndex = 0
+                
+                while nextIndex < toImport.count {
+                    // Add tasks up to concurrency limit
+                    while inFlight < concurrency && nextIndex < toImport.count {
+                        let asset = toImport[nextIndex]
+                        let index = nextIndex
+                        nextIndex += 1
+                        inFlight += 1
+                        
+                        group.addTask {
+                            await self.processAsset(
+                                asset: asset,
+                                index: index,
+                                total: totalCount,
+                                config: config,
+                                immich: immich,
+                                tracker: tracker,
+                                stats: stats,
+                                dryRun: self.dryRun,
+                                allowNetwork: self.includeCloud
+                            )
+                            
+                            // Small delay per task to be gentle on iCloud
+                            if self.delay > 0 {
+                                try? await Task.sleep(nanoseconds: UInt64(self.delay * 1_000_000_000))
+                            }
+                        }
+                    }
+                    
+                    // Wait for one to complete before adding more
+                    await group.next()
+                    inFlight -= 1
                 }
                 
-                // Track as imported
-                try? tracker.markImported(
-                    uuid: asset.localIdentifier,
-                    immichID: uploadResult.assetID,
-                    filename: downloadResult.filename,
-                    fileSize: downloadResult.fileSize,
-                    mediaType: downloadResult.mediaType
-                )
-            } else {
-                print("  ERROR: \(uploadResult.error ?? "Upload failed")")
-                stats.failed += 1
-            }
-            
-            // Delay between iCloud downloads to be gentle
-            if isCloud && index < toImport.count - 1 && delay > 0 {
-                print("  Waiting \(Int(delay))s before next download...")
-                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                // Wait for remaining tasks
+                for await _ in group {}
             }
         }
         
         // Summary
+        let finalStats = await stats.getStats()
         print()
         print(String(repeating: "=", count: 50))
         print("IMPORT COMPLETE")
         print(String(repeating: "=", count: 50))
-        print("Exported:   \(formatNumber(stats.exported))")
-        print("Uploaded:   \(formatNumber(stats.uploaded))")
-        print("Duplicates: \(formatNumber(stats.duplicates))")
-        print("Failed:     \(formatNumber(stats.failed))")
+        print("Exported:   \(formatNumber(finalStats.exported))")
+        print("Uploaded:   \(formatNumber(finalStats.uploaded))")
+        print("Duplicates: \(formatNumber(finalStats.duplicates))")
+        print("Failed:     \(formatNumber(finalStats.failed))")
         if dryRun {
-            print("Skipped:    \(formatNumber(stats.skipped)) (dry run)")
+            print("Skipped:    \(formatNumber(finalStats.skipped)) (dry run)")
         }
         
-        let finalStats = tracker.getStats()
+        let trackerStats = tracker.getStats()
         print()
-        print("Total in Immich: \(formatNumber(finalStats.total)) (\(formatBytes(finalStats.totalBytes)))")
+        print("Total in Immich: \(formatNumber(trackerStats.total)) (\(formatBytes(trackerStats.totalBytes)))")
+    }
+    
+    private func processAsset(
+        asset: PhotosFetcher.AssetInfo,
+        index: Int,
+        total: Int,
+        config: Config,
+        immich: ImmichClient,
+        tracker: Tracker,
+        stats: ImportStatsActor,
+        dryRun: Bool,
+        allowNetwork: Bool
+    ) async {
+        let num = index + 1
+        print("[\(num)/\(total)] \(asset.filename)")
+        
+        if dryRun {
+            print("  DRY RUN: Would download and upload")
+            await stats.incrementSkipped()
+            return
+        }
+        
+        // Export/download the asset
+        if allowNetwork {
+            print("  Downloading from iCloud...")
+        } else {
+            print("  Exporting...")
+        }
+        
+        let downloadResult = await PhotosFetcher.downloadAsset(
+            identifier: asset.localIdentifier,
+            to: config.stagingDir,
+            allowNetwork: allowNetwork
+        )
+        
+        if !downloadResult.success {
+            print("  ERROR: \(downloadResult.error ?? "Download failed")")
+            await stats.incrementFailed()
+            return
+        }
+        
+        guard let fileURL = downloadResult.fileURL else {
+            print("  ERROR: No file URL")
+            await stats.incrementFailed()
+            return
+        }
+        
+        await stats.incrementExported()
+        print("  Exported: \(formatBytes(downloadResult.fileSize))")
+        
+        // Get dates
+        let dates = PhotosFetcher.getAssetDates(identifier: asset.localIdentifier)
+        
+        // Upload to Immich
+        let uploadResult = await immich.uploadAsset(
+            fileURL: fileURL,
+            deviceAssetID: asset.localIdentifier,
+            fileCreatedAt: dates.created,
+            fileModifiedAt: dates.modified
+        )
+        
+        // Clean up staging file
+        try? FileManager.default.removeItem(at: fileURL)
+        
+        if uploadResult.success {
+            if uploadResult.duplicate {
+                print("  Duplicate in Immich")
+                await stats.incrementDuplicates()
+            } else {
+                print("  Uploaded: \(uploadResult.assetID ?? "unknown")")
+                await stats.incrementUploaded()
+            }
+            
+            // Track as imported
+            try? tracker.markImported(
+                uuid: asset.localIdentifier,
+                immichID: uploadResult.assetID,
+                filename: downloadResult.filename,
+                fileSize: downloadResult.fileSize,
+                mediaType: downloadResult.mediaType
+            )
+        } else {
+            print("  ERROR: \(uploadResult.error ?? "Upload failed")")
+            await stats.incrementFailed()
+        }
     }
     
     private func formatNumber(_ n: Int) -> String {
@@ -221,10 +302,21 @@ struct ImportCommand: AsyncParsableCommand {
     }
 }
 
-private struct ImportStats {
-    var exported = 0
-    var uploaded = 0
-    var duplicates = 0
-    var failed = 0
-    var skipped = 0
+// Thread-safe stats using actor
+actor ImportStatsActor {
+    private var exported = 0
+    private var uploaded = 0
+    private var duplicates = 0
+    private var failed = 0
+    private var skipped = 0
+    
+    func incrementExported() { exported += 1 }
+    func incrementUploaded() { uploaded += 1 }
+    func incrementDuplicates() { duplicates += 1 }
+    func incrementFailed() { failed += 1 }
+    func incrementSkipped() { skipped += 1 }
+    
+    func getStats() -> (exported: Int, uploaded: Int, duplicates: Int, failed: Int, skipped: Int) {
+        (exported, uploaded, duplicates, failed, skipped)
+    }
 }

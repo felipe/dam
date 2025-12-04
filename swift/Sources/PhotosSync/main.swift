@@ -11,6 +11,7 @@ struct PhotosSync: AsyncParsableCommand {
             ImportCommand.self,
             StatusCommand.self,
             CleanupCommand.self,
+            SyncCommand.self,
         ],
         defaultSubcommand: StatusCommand.self
     )

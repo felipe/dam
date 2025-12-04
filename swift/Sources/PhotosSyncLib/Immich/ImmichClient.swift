@@ -1,26 +1,26 @@
 import Foundation
 
 /// Client for Immich API
-class ImmichClient {
+public final class ImmichClient: Sendable {
     private let baseURL: String
     private let apiKey: String
     private let session: URLSession
     
-    struct UploadResult {
-        let success: Bool
-        let assetID: String?
-        let duplicate: Bool
-        let error: String?
+    public struct UploadResult: Sendable {
+        public let success: Bool
+        public let assetID: String?
+        public let duplicate: Bool
+        public let error: String?
     }
     
-    init(baseURL: String, apiKey: String) {
+    public init(baseURL: String, apiKey: String, session: URLSession = .shared) {
         self.baseURL = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
         self.apiKey = apiKey
-        self.session = URLSession.shared
+        self.session = session
     }
     
     /// Test connection to Immich
-    func ping() async -> Bool {
+    public func ping() async -> Bool {
         guard let url = URL(string: "\(baseURL)/api/server/ping") else { return false }
         
         var request = URLRequest(url: url)
@@ -35,7 +35,7 @@ class ImmichClient {
     }
     
     /// Upload an asset to Immich
-    func uploadAsset(
+    public func uploadAsset(
         fileURL: URL,
         deviceAssetID: String,
         deviceID: String = "photos-sync",
@@ -123,7 +123,7 @@ class ImmichClient {
     }
     
     /// Get all asset IDs from Immich (for cleanup comparison)
-    func getAllAssetIDs() async -> Set<String> {
+    public func getAllAssetIDs() async -> Set<String> {
         var assetIDs = Set<String>()
         var page = 1
         let pageSize = 1000
@@ -156,8 +156,87 @@ class ImmichClient {
         return assetIDs
     }
     
+    public struct AssetInfo: Sendable {
+        public let id: String
+        public let deviceAssetId: String
+        public let originalFileName: String
+        public let type: String  // IMAGE or VIDEO
+        public let fileSize: Int64
+    }
+    
+    /// Get all assets from Immich with metadata (for syncing tracker)
+    public func getAllAssets(deviceId: String? = "photos-sync", progress: ((Int) -> Void)? = nil) async -> [AssetInfo] {
+        var assets: [AssetInfo] = []
+        var page = 1
+        let pageSize = 250  // Immich caps at 250 per page
+        
+        while true {
+            guard let url = URL(string: "\(baseURL)/api/search/metadata") else { break }
+            
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            
+            var body: [String: Any] = [
+                "take": pageSize,
+                "page": page
+            ]
+            if let deviceId = deviceId {
+                body["deviceId"] = deviceId
+            }
+            request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            
+            do {
+                let (data, _) = try await session.data(for: request)
+                guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let assetsData = json["assets"] as? [String: Any],
+                      let items = assetsData["items"] as? [[String: Any]] else { break }
+                
+                if items.isEmpty { break }
+                
+                for item in items {
+                    if let id = item["id"] as? String,
+                       let deviceAssetId = item["deviceAssetId"] as? String {
+                        let filename = item["originalFileName"] as? String ?? ""
+                        let type = item["type"] as? String ?? "IMAGE"
+                        assets.append(AssetInfo(
+                            id: id,
+                            deviceAssetId: deviceAssetId,
+                            originalFileName: filename,
+                            type: type,
+                            fileSize: 0
+                        ))
+                    }
+                }
+                
+                progress?(assets.count)
+                
+                // Check if there's a next page (can be Int or String)
+                let hasNextPage: Bool
+                if let nextInt = assetsData["nextPage"] as? Int {
+                    hasNextPage = true
+                    _ = nextInt  // silence unused warning
+                } else if let nextStr = assetsData["nextPage"] as? String, !nextStr.isEmpty {
+                    hasNextPage = true
+                } else {
+                    hasNextPage = assetsData["nextPage"] != nil && !(assetsData["nextPage"] is NSNull)
+                }
+                
+                if !hasNextPage {
+                    break
+                }
+                page += 1
+            } catch {
+                break
+            }
+        }
+        
+        return assets
+    }
+    
     /// Check if an asset exists in Immich by device asset ID
-    func assetExists(deviceAssetID: String) async -> Bool {
+    public func assetExists(deviceAssetID: String) async -> Bool {
         // Use search endpoint
         guard let url = URL(string: "\(baseURL)/api/search/metadata") else { return false }
         
@@ -181,6 +260,45 @@ class ImmichClient {
             return !items.isEmpty
         } catch {
             return false
+        }
+    }
+    
+    /// Archive assets in Immich (hide them without deleting)
+    public func archiveAssets(ids: [String]) async -> Bool {
+        guard let url = URL(string: "\(baseURL)/api/assets") else { return false }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        let body: [String: Any] = [
+            "ids": ids,
+            "isArchived": true
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        
+        do {
+            let (_, response) = try await session.data(for: request)
+            return (response as? HTTPURLResponse)?.statusCode == 204
+        } catch {
+            return false
+        }
+    }
+    
+    /// Get asset info by ID
+    public func getAsset(id: String) async -> [String: Any]? {
+        guard let url = URL(string: "\(baseURL)/api/assets/\(id)") else { return nil }
+        
+        var request = URLRequest(url: url)
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        } catch {
+            return nil
         }
     }
     
