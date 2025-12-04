@@ -37,18 +37,7 @@ let package = Package(
             dependencies: [
                 "PhotosSyncLib",
             ],
-            path: "Tests/PhotosSyncTests",
-            swiftSettings: [
-                .unsafeFlags([
-                    "-F", "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks"
-                ])
-            ],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-F", "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
-                    "-framework", "Testing"
-                ])
-            ]
+            path: "Tests/PhotosSyncTests"
         ),
     ]
 )
