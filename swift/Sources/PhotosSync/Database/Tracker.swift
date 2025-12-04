@@ -36,12 +36,14 @@ class Tracker {
                 filename TEXT NOT NULL,
                 file_size INTEGER NOT NULL,
                 media_type TEXT NOT NULL,
-                imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                archived INTEGER DEFAULT 0
             );
             
             CREATE INDEX IF NOT EXISTS idx_imported_at ON imported_assets(imported_at);
             CREATE INDEX IF NOT EXISTS idx_media_type ON imported_assets(media_type);
             CREATE INDEX IF NOT EXISTS idx_immich_id ON imported_assets(immich_id);
+            CREATE INDEX IF NOT EXISTS idx_archived ON imported_assets(archived);
         """
         
         var errMsg: UnsafeMutablePointer<CChar>?
@@ -186,6 +188,82 @@ class Tracker {
             return sqlite3_column_int64(stmt, 0)
         }
         return nil
+    }
+    
+    /// Mark an asset as archived (deleted from Photos, kept in Immich)
+    func markArchived(uuid: String) throws {
+        try queue.sync {
+            let sql = "UPDATE imported_assets SET archived = 1 WHERE icloud_uuid = ?"
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw TrackerError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
+            
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
+            }
+        }
+    }
+    
+    /// Check if an asset is archived
+    func isArchived(uuid: String) -> Bool {
+        let sql = "SELECT archived FROM imported_assets WHERE icloud_uuid = ? LIMIT 1"
+        var stmt: OpaquePointer?
+        
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+        
+        sqlite3_bind_text(stmt, 1, uuid, -1, nil)
+        
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            return sqlite3_column_int(stmt, 0) == 1
+        }
+        return false
+    }
+    
+    /// Get all non-archived imported UUIDs (for import comparison)
+    func getActiveImportedUUIDs() -> Set<String> {
+        var uuids = Set<String>()
+        let sql = "SELECT icloud_uuid FROM imported_assets WHERE archived = 0 OR archived IS NULL"
+        var stmt: OpaquePointer?
+        
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return uuids
+        }
+        defer { sqlite3_finalize(stmt) }
+        
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let cString = sqlite3_column_text(stmt, 0) {
+                uuids.insert(String(cString: cString))
+            }
+        }
+        
+        return uuids
+    }
+    
+    /// Remove an asset from tracking (when deleted from both Photos and Immich)
+    func removeAsset(uuid: String) throws {
+        try queue.sync {
+            let sql = "DELETE FROM imported_assets WHERE icloud_uuid = ?"
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw TrackerError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
+            
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
+            }
+        }
     }
 }
 

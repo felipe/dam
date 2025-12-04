@@ -263,6 +263,45 @@ class ImmichClient {
         }
     }
     
+    /// Archive assets in Immich (hide them without deleting)
+    func archiveAssets(ids: [String]) async -> Bool {
+        guard let url = URL(string: "\(baseURL)/api/assets") else { return false }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        let body: [String: Any] = [
+            "ids": ids,
+            "isArchived": true
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        
+        do {
+            let (_, response) = try await session.data(for: request)
+            return (response as? HTTPURLResponse)?.statusCode == 204
+        } catch {
+            return false
+        }
+    }
+    
+    /// Get asset info by ID
+    func getAsset(id: String) async -> [String: Any]? {
+        guard let url = URL(string: "\(baseURL)/api/assets/\(id)") else { return nil }
+        
+        var request = URLRequest(url: url)
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        } catch {
+            return nil
+        }
+    }
+    
     private func formatDate(_ date: Date) -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]

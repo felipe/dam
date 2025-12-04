@@ -5,14 +5,17 @@ import Photos
 struct CleanupCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "cleanup",
-        abstract: "Delete photos from Photos.app that have been removed from Immich"
+        abstract: "Sync deletions between Photos and Immich (Immich is source of truth)"
     )
     
-    @Flag(name: .long, help: "Preview what would be deleted without making changes")
+    @Flag(name: .long, help: "Preview what would be changed without making changes")
     var dryRun: Bool = false
     
-    @Option(name: .long, help: "Maximum number of photos to delete (0 = unlimited)")
+    @Option(name: .long, help: "Maximum number of items to process (0 = unlimited)")
     var limit: Int = 0
+    
+    @Flag(name: .long, help: "Skip confirmation prompt for bulk operations")
+    var force: Bool = false
     
     func run() async throws {
         print("Requesting Photos access...")
@@ -49,86 +52,177 @@ struct CleanupCommand: AsyncParsableCommand {
         let immichAssetIDs = await immich.getAllAssetIDs()
         print("Assets in Immich: \(formatNumber(immichAssetIDs.count))")
         
-        // Find imports that are no longer in Immich (deleted/deduped)
-        var toDelete: [(uuid: String, immichID: String?)] = []
+        // Get current Photos library UUIDs
+        print("Fetching Photos library...")
+        let photosAssets = PhotosFetcher.getAllAssets()
+        let photosUUIDs = Set(photosAssets.map { $0.localIdentifier })
+        print("Assets in Photos: \(formatNumber(photosUUIDs.count))")
+        
+        // === PART 1: Deleted from Immich → Delete from Photos ===
+        var toDeleteFromPhotos: [(uuid: String, immichID: String)] = []
         
         for uuid in importedUUIDs {
             if let immichID = tracker.getImmichIDForUUID(uuid) {
                 if !immichAssetIDs.contains(immichID) {
-                    // This was imported but no longer exists in Immich
-                    toDelete.append((uuid: uuid, immichID: immichID))
+                    // This was imported but no longer exists in Immich - delete from Photos
+                    toDeleteFromPhotos.append((uuid: uuid, immichID: immichID))
                 }
             }
         }
         
-        // Apply limit
-        if limit > 0 && toDelete.count > limit {
-            toDelete = Array(toDelete.prefix(limit))
-        }
+        // === PART 2: Deleted from Photos → Archive in Immich ===
+        var toArchiveInImmich: [(uuid: String, immichID: String)] = []
         
-        print("Assets to delete from Photos: \(formatNumber(toDelete.count))")
-        
-        if toDelete.isEmpty {
-            print("Nothing to clean up.")
-            return
-        }
-        
-        print()
-        print(String(repeating: "=", count: 50))
-        print("CLEANUP - DELETE \(formatNumber(toDelete.count)) ASSETS")
-        print(String(repeating: "=", count: 50))
-        print()
-        print("These photos were imported to Immich but have since been deleted")
-        print("(likely as duplicates). They will be moved to Recently Deleted.")
-        print()
-        
-        if dryRun {
-            print("Would delete \(formatNumber(toDelete.count)) assets from Photos.app")
-            for item in toDelete.prefix(10) {
-                print("  - \(item.uuid)")
+        for uuid in importedUUIDs {
+            // Skip already archived
+            if tracker.isArchived(uuid: uuid) {
+                continue
             }
-            if toDelete.count > 10 {
-                print("  ... and \(toDelete.count - 10) more")
-            }
-            return
-        }
-        
-        // Confirm before deleting
-        print("Press Enter to continue or Ctrl+C to cancel...")
-        _ = readLine()
-        
-        var deleted = 0
-        var failed = 0
-        
-        // Delete in batches of 50
-        let batchSize = 50
-        for batchStart in stride(from: 0, to: toDelete.count, by: batchSize) {
-            let batchEnd = min(batchStart + batchSize, toDelete.count)
-            let batch = Array(toDelete[batchStart..<batchEnd])
-            let uuids = batch.map { $0.uuid }
             
-            print("Deleting batch \(batchStart/batchSize + 1)...")
-            
-            let results = await PhotosDeleter.deleteAssets(identifiers: uuids, dryRun: false)
-            
-            for result in results {
-                if result.success {
-                    deleted += 1
-                } else {
-                    print("  Failed to delete \(result.localIdentifier): \(result.error ?? "unknown")")
-                    failed += 1
+            if let immichID = tracker.getImmichIDForUUID(uuid) {
+                // Check if it still exists in Immich but not in Photos
+                if immichAssetIDs.contains(immichID) && !photosUUIDs.contains(uuid) {
+                    toArchiveInImmich.append((uuid: uuid, immichID: immichID))
                 }
             }
         }
         
+        // Apply limits
+        if limit > 0 {
+            if toDeleteFromPhotos.count > limit {
+                toDeleteFromPhotos = Array(toDeleteFromPhotos.prefix(limit))
+            }
+            if toArchiveInImmich.count > limit {
+                toArchiveInImmich = Array(toArchiveInImmich.prefix(limit))
+            }
+        }
+        
         print()
-        print(String(repeating: "=", count: 50))
+        print(String(repeating: "=", count: 60))
+        print("CLEANUP SUMMARY")
+        print(String(repeating: "=", count: 60))
+        print("Delete from Photos (removed in Immich): \(formatNumber(toDeleteFromPhotos.count))")
+        print("Archive in Immich (removed in Photos):  \(formatNumber(toArchiveInImmich.count))")
+        print()
+        
+        if toDeleteFromPhotos.isEmpty && toArchiveInImmich.isEmpty {
+            print("Nothing to clean up. Everything is in sync!")
+            return
+        }
+        
+        // === Process deletions from Photos ===
+        if !toDeleteFromPhotos.isEmpty {
+            print()
+            print("--- DELETE FROM PHOTOS ---")
+            print("These assets were deleted/deduped in Immich.")
+            print("They will be moved to Recently Deleted in Photos.")
+            print()
+            
+            if dryRun {
+                print("Would delete \(formatNumber(toDeleteFromPhotos.count)) assets:")
+                for item in toDeleteFromPhotos.prefix(10) {
+                    print("  - \(item.uuid)")
+                }
+                if toDeleteFromPhotos.count > 10 {
+                    print("  ... and \(toDeleteFromPhotos.count - 10) more")
+                }
+            } else {
+                // Confirm for bulk deletions
+                if toDeleteFromPhotos.count > 10 && !force {
+                    print("About to delete \(formatNumber(toDeleteFromPhotos.count)) assets.")
+                    print("Press Enter to continue or Ctrl+C to cancel...")
+                    _ = readLine()
+                }
+                
+                var deleted = 0
+                var failed = 0
+                
+                let batchSize = 50
+                for batchStart in stride(from: 0, to: toDeleteFromPhotos.count, by: batchSize) {
+                    let batchEnd = min(batchStart + batchSize, toDeleteFromPhotos.count)
+                    let batch = Array(toDeleteFromPhotos[batchStart..<batchEnd])
+                    let uuids = batch.map { $0.uuid }
+                    
+                    print("Deleting batch \(batchStart/batchSize + 1)/\((toDeleteFromPhotos.count + batchSize - 1)/batchSize)...")
+                    
+                    let results = await PhotosDeleter.deleteAssets(identifiers: uuids, dryRun: false)
+                    
+                    for (idx, result) in results.enumerated() {
+                        if result.success {
+                            deleted += 1
+                            // Remove from tracker since it's gone from both places
+                            try? tracker.removeAsset(uuid: batch[idx].uuid)
+                        } else {
+                            print("  Failed: \(result.localIdentifier): \(result.error ?? "unknown")")
+                            failed += 1
+                        }
+                    }
+                }
+                
+                print("Deleted: \(formatNumber(deleted)), Failed: \(formatNumber(failed))")
+            }
+        }
+        
+        // === Process archives in Immich ===
+        if !toArchiveInImmich.isEmpty {
+            print()
+            print("--- ARCHIVE IN IMMICH ---")
+            print("These assets were deleted from Photos but exist in Immich.")
+            print("They will be archived (hidden) in Immich to prevent re-upload.")
+            print()
+            
+            if dryRun {
+                print("Would archive \(formatNumber(toArchiveInImmich.count)) assets:")
+                for item in toArchiveInImmich.prefix(10) {
+                    print("  - \(item.uuid) → \(item.immichID)")
+                }
+                if toArchiveInImmich.count > 10 {
+                    print("  ... and \(toArchiveInImmich.count - 10) more")
+                }
+            } else {
+                // Confirm for bulk archives
+                if toArchiveInImmich.count > 10 && !force {
+                    print("About to archive \(formatNumber(toArchiveInImmich.count)) assets.")
+                    print("Press Enter to continue or Ctrl+C to cancel...")
+                    _ = readLine()
+                }
+                
+                var archived = 0
+                var failed = 0
+                
+                // Archive in batches
+                let batchSize = 50
+                for batchStart in stride(from: 0, to: toArchiveInImmich.count, by: batchSize) {
+                    let batchEnd = min(batchStart + batchSize, toArchiveInImmich.count)
+                    let batch = Array(toArchiveInImmich[batchStart..<batchEnd])
+                    let immichIDs = batch.map { $0.immichID }
+                    
+                    print("Archiving batch \(batchStart/batchSize + 1)/\((toArchiveInImmich.count + batchSize - 1)/batchSize)...")
+                    
+                    let success = await immich.archiveAssets(ids: immichIDs)
+                    
+                    if success {
+                        for item in batch {
+                            try? tracker.markArchived(uuid: item.uuid)
+                            archived += 1
+                        }
+                    } else {
+                        print("  Failed to archive batch")
+                        failed += batch.count
+                    }
+                }
+                
+                print("Archived: \(formatNumber(archived)), Failed: \(formatNumber(failed))")
+            }
+        }
+        
+        print()
+        print(String(repeating: "=", count: 60))
         print("CLEANUP COMPLETE")
-        print(String(repeating: "=", count: 50))
-        print("Deleted: \(formatNumber(deleted))")
-        print("Failed:  \(formatNumber(failed))")
-        print()
-        print("Note: Deleted photos are in 'Recently Deleted' for 30 days")
+        print(String(repeating: "=", count: 60))
+        if !dryRun {
+            print("Note: Deleted Photos are in 'Recently Deleted' for 30 days")
+        }
     }
     
     private func formatNumber(_ n: Int) -> String {
