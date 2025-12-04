@@ -13,10 +13,10 @@ public final class ImmichClient: Sendable {
         public let error: String?
     }
     
-    public init(baseURL: String, apiKey: String) {
+    public init(baseURL: String, apiKey: String, session: URLSession = .shared) {
         self.baseURL = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
         self.apiKey = apiKey
-        self.session = URLSession.shared
+        self.session = session
     }
     
     /// Test connection to Immich
