@@ -58,7 +58,7 @@ struct SyncCommand: AsyncParsableCommand {
                 continue
             }
             
-            // Add to tracker
+            // Add to tracker with default subtypes (unknown from Immich)
             let mediaType = asset.type == "VIDEO" ? "video" : "photo"
             do {
                 try tracker.markImported(
@@ -66,7 +66,9 @@ struct SyncCommand: AsyncParsableCommand {
                     immichID: asset.id,
                     filename: asset.originalFileName,
                     fileSize: asset.fileSize,
-                    mediaType: mediaType
+                    mediaType: mediaType,
+                    subtypes: .none,
+                    motionVideoImmichID: nil
                 )
                 added += 1
             } catch {

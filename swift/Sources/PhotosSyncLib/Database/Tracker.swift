@@ -745,6 +745,50 @@ public final class Tracker: @unchecked Sendable {
             }
         }
     }
+    
+    /// Update all subtype flags for an asset (preserves other data like immich_id, filename, etc.)
+    public func updateSubtypes(uuid: String, subtypes: AssetSubtypes) throws {
+        try queue.sync {
+            let sql = """
+                UPDATE imported_assets SET 
+                    is_live_photo = ?,
+                    is_portrait = ?,
+                    is_hdr = ?,
+                    is_panorama = ?,
+                    is_screenshot = ?,
+                    is_cinematic = ?,
+                    is_slomo = ?,
+                    is_timelapse = ?,
+                    is_spatial_video = ?,
+                    is_proraw = ?,
+                    has_paired_video = ?
+                WHERE icloud_uuid = ?
+            """
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw TrackerError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            sqlite3_bind_int(stmt, 1, subtypes.isLivePhoto ? 1 : 0)
+            sqlite3_bind_int(stmt, 2, subtypes.isPortrait ? 1 : 0)
+            sqlite3_bind_int(stmt, 3, subtypes.isHDR ? 1 : 0)
+            sqlite3_bind_int(stmt, 4, subtypes.isPanorama ? 1 : 0)
+            sqlite3_bind_int(stmt, 5, subtypes.isScreenshot ? 1 : 0)
+            sqlite3_bind_int(stmt, 6, subtypes.isCinematic ? 1 : 0)
+            sqlite3_bind_int(stmt, 7, subtypes.isSlomo ? 1 : 0)
+            sqlite3_bind_int(stmt, 8, subtypes.isTimelapse ? 1 : 0)
+            sqlite3_bind_int(stmt, 9, subtypes.isSpatialVideo ? 1 : 0)
+            sqlite3_bind_int(stmt, 10, subtypes.isProRAW ? 1 : 0)
+            sqlite3_bind_int(stmt, 11, subtypes.hasPairedVideo ? 1 : 0)
+            sqlite3_bind_text(stmt, 12, uuid, -1, SQLITE_TRANSIENT)
+            
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
+            }
+        }
+    }
 }
 
 public enum TrackerError: Error {
