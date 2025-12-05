@@ -7,12 +7,12 @@ public struct Config: Sendable {
     public let dataDir: URL
     public let batchSize: Int
     public let dryRun: Bool
-
+    
     public var trackerDBPath: URL {
         dataDir.appendingPathComponent("tracker.db")
     }
-
-    /// Directory for storing Cinematic video sidecars (AAE, base video, rendered video)
+    
+    /// Directory for storing Cinematic video sidecars
     public var sidecarDir: URL {
         dataDir.appendingPathComponent("sidecars")
     }
@@ -52,8 +52,8 @@ public struct Config: Sendable {
         // Ensure directories exist
         try? FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
-
-        let config = Config(
+        
+        return Config(
             immichURL: immichURL,
             immichAPIKey: immichAPIKey,
             stagingDir: stagingDir,
@@ -61,11 +61,6 @@ public struct Config: Sendable {
             batchSize: batchSize,
             dryRun: dryRun
         )
-
-        // Create sidecar directory for Cinematic video sidecars
-        try? FileManager.default.createDirectory(at: config.sidecarDir, withIntermediateDirectories: true)
-
-        return config
     }
     
     private static func findDAMDirectory() -> URL {

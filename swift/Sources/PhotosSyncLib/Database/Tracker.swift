@@ -98,38 +98,54 @@ public final class Tracker: @unchecked Sendable {
         }
         
         // Create index for Live Photo queries
-        let indexSql = "CREATE INDEX IF NOT EXISTS idx_is_live_photo ON imported_assets(is_live_photo)"
+        var indexSql = "CREATE INDEX IF NOT EXISTS idx_is_live_photo ON imported_assets(is_live_photo)"
         if sqlite3_exec(db, indexSql, nil, nil, &errMsg) != SQLITE_OK {
             // Index creation failure is non-fatal
             sqlite3_free(errMsg)
+            errMsg = nil
         }
-
-        // Migration 2: Add Cinematic video columns
-        if !columns.contains("is_cinematic") {
-            let sql = "ALTER TABLE imported_assets ADD COLUMN is_cinematic INTEGER DEFAULT NULL"
-            if sqlite3_exec(db, sql, nil, nil, &errMsg) != SQLITE_OK {
-                let error = errMsg.map { String(cString: $0) } ?? "Unknown error"
-                sqlite3_free(errMsg)
-                throw TrackerError.execFailed("Migration failed (is_cinematic): \(error)")
+        
+        // Migration 2: Add subtype columns for special media tracking
+        let subtypeColumns = [
+            "is_portrait",
+            "is_hdr", 
+            "is_panorama",
+            "is_screenshot",
+            "is_cinematic",
+            "is_slomo",
+            "is_timelapse",
+            "is_spatial_video",
+            "is_proraw",
+            "has_paired_video",
+            "cinematic_sidecars"  // JSON array of sidecar filenames
+        ]
+        
+        // Re-fetch columns after previous migrations
+        let currentColumns = getColumnNames(table: "imported_assets")
+        
+        for column in subtypeColumns {
+            if !currentColumns.contains(column) {
+                let colType = column == "cinematic_sidecars" ? "TEXT" : "INTEGER DEFAULT NULL"
+                let sql = "ALTER TABLE imported_assets ADD COLUMN \(column) \(colType)"
+                if sqlite3_exec(db, sql, nil, nil, &errMsg) != SQLITE_OK {
+                    let error = errMsg.map { String(cString: $0) } ?? "Unknown error"
+                    sqlite3_free(errMsg)
+                    errMsg = nil
+                    // Log but don't fail - column might already exist
+                    print("Migration warning (\(column)): \(error)")
+                }
             }
         }
-
-        // Store sidecar filenames as JSON array for Cinematic videos
-        if !columns.contains("cinematic_sidecars") {
-            let sql = "ALTER TABLE imported_assets ADD COLUMN cinematic_sidecars TEXT"
-            if sqlite3_exec(db, sql, nil, nil, &errMsg) != SQLITE_OK {
-                let error = errMsg.map { String(cString: $0) } ?? "Unknown error"
-                sqlite3_free(errMsg)
-                throw TrackerError.execFailed("Migration failed (cinematic_sidecars): \(error)")
-            }
-        }
-
-        // Create index for Cinematic queries
-        let cinematicIndexSql = "CREATE INDEX IF NOT EXISTS idx_is_cinematic ON imported_assets(is_cinematic)"
-        if sqlite3_exec(db, cinematicIndexSql, nil, nil, &errMsg) != SQLITE_OK {
-            // Index creation failure is non-fatal
-            sqlite3_free(errMsg)
-        }
+        
+        // Create indexes for common queries
+        indexSql = "CREATE INDEX IF NOT EXISTS idx_has_paired_video ON imported_assets(has_paired_video)"
+        sqlite3_exec(db, indexSql, nil, nil, &errMsg)
+        sqlite3_free(errMsg)
+        errMsg = nil
+        
+        indexSql = "CREATE INDEX IF NOT EXISTS idx_is_cinematic ON imported_assets(is_cinematic)"
+        sqlite3_exec(db, indexSql, nil, nil, &errMsg)
+        sqlite3_free(errMsg)
     }
     
     private func getColumnNames(table: String) -> Set<String> {
@@ -187,22 +203,68 @@ public final class Tracker: @unchecked Sendable {
         }
     }
     
+    /// Asset subtype information for tracking
+    public struct AssetSubtypes: Sendable {
+        public let isLivePhoto: Bool
+        public let isPortrait: Bool
+        public let isHDR: Bool
+        public let isPanorama: Bool
+        public let isScreenshot: Bool
+        public let isCinematic: Bool
+        public let isSlomo: Bool
+        public let isTimelapse: Bool
+        public let isSpatialVideo: Bool
+        public let isProRAW: Bool
+        public let hasPairedVideo: Bool
+        
+        public init(
+            isLivePhoto: Bool = false,
+            isPortrait: Bool = false,
+            isHDR: Bool = false,
+            isPanorama: Bool = false,
+            isScreenshot: Bool = false,
+            isCinematic: Bool = false,
+            isSlomo: Bool = false,
+            isTimelapse: Bool = false,
+            isSpatialVideo: Bool = false,
+            isProRAW: Bool = false,
+            hasPairedVideo: Bool = false
+        ) {
+            self.isLivePhoto = isLivePhoto
+            self.isPortrait = isPortrait
+            self.isHDR = isHDR
+            self.isPanorama = isPanorama
+            self.isScreenshot = isScreenshot
+            self.isCinematic = isCinematic
+            self.isSlomo = isSlomo
+            self.isTimelapse = isTimelapse
+            self.isSpatialVideo = isSpatialVideo
+            self.isProRAW = isProRAW
+            self.hasPairedVideo = hasPairedVideo
+        }
+        
+        /// Create default subtypes (no special flags)
+        public static let none = AssetSubtypes()
+    }
+    
     public func markImported(
         uuid: String,
         immichID: String?,
         filename: String,
         fileSize: Int64,
         mediaType: String,
-        isLivePhoto: Bool = false,
+        subtypes: AssetSubtypes = .none,
         motionVideoImmichID: String? = nil,
-        isCinematic: Bool = false,
         cinematicSidecars: [String]? = nil
     ) throws {
         try queue.sync {
             let sql = """
-                INSERT OR REPLACE INTO imported_assets
-                (icloud_uuid, immich_id, filename, file_size, media_type, imported_at, is_live_photo, motion_video_immich_id, is_cinematic, cinematic_sidecars)
-                VALUES (?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?)
+                INSERT OR REPLACE INTO imported_assets 
+                (icloud_uuid, immich_id, filename, file_size, media_type, imported_at,
+                 is_live_photo, is_portrait, is_hdr, is_panorama, is_screenshot,
+                 is_cinematic, is_slomo, is_timelapse, is_spatial_video, is_proraw,
+                 has_paired_video, motion_video_immich_id, cinematic_sidecars)
+                VALUES (?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
             var stmt: OpaquePointer?
 
@@ -220,29 +282,64 @@ public final class Tracker: @unchecked Sendable {
             sqlite3_bind_text(stmt, 3, filename, -1, SQLITE_TRANSIENT)
             sqlite3_bind_int64(stmt, 4, fileSize)
             sqlite3_bind_text(stmt, 5, mediaType, -1, SQLITE_TRANSIENT)
-            sqlite3_bind_int(stmt, 6, isLivePhoto ? 1 : 0)
+            
+            // Bind subtype flags
+            sqlite3_bind_int(stmt, 6, subtypes.isLivePhoto ? 1 : 0)
+            sqlite3_bind_int(stmt, 7, subtypes.isPortrait ? 1 : 0)
+            sqlite3_bind_int(stmt, 8, subtypes.isHDR ? 1 : 0)
+            sqlite3_bind_int(stmt, 9, subtypes.isPanorama ? 1 : 0)
+            sqlite3_bind_int(stmt, 10, subtypes.isScreenshot ? 1 : 0)
+            sqlite3_bind_int(stmt, 11, subtypes.isCinematic ? 1 : 0)
+            sqlite3_bind_int(stmt, 12, subtypes.isSlomo ? 1 : 0)
+            sqlite3_bind_int(stmt, 13, subtypes.isTimelapse ? 1 : 0)
+            sqlite3_bind_int(stmt, 14, subtypes.isSpatialVideo ? 1 : 0)
+            sqlite3_bind_int(stmt, 15, subtypes.isProRAW ? 1 : 0)
+            sqlite3_bind_int(stmt, 16, subtypes.hasPairedVideo ? 1 : 0)
+            
             if let motionVideoImmichID = motionVideoImmichID {
-                sqlite3_bind_text(stmt, 7, motionVideoImmichID, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(stmt, 17, motionVideoImmichID, -1, SQLITE_TRANSIENT)
             } else {
-                sqlite3_bind_null(stmt, 7)
+                sqlite3_bind_null(stmt, 17)
             }
-            sqlite3_bind_int(stmt, 8, isCinematic ? 1 : 0)
+            
             if let sidecars = cinematicSidecars, !sidecars.isEmpty {
                 // Store as JSON array
                 if let jsonData = try? JSONSerialization.data(withJSONObject: sidecars),
                    let jsonString = String(data: jsonData, encoding: .utf8) {
-                    sqlite3_bind_text(stmt, 9, jsonString, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_text(stmt, 18, jsonString, -1, SQLITE_TRANSIENT)
                 } else {
-                    sqlite3_bind_null(stmt, 9)
+                    sqlite3_bind_null(stmt, 18)
                 }
             } else {
-                sqlite3_bind_null(stmt, 9)
+                sqlite3_bind_null(stmt, 18)
             }
 
             if sqlite3_step(stmt) != SQLITE_DONE {
                 throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
             }
         }
+    }
+    
+    /// Backward-compatible version for Live Photo imports
+    public func markImportedLivePhoto(
+        uuid: String,
+        immichID: String?,
+        filename: String,
+        fileSize: Int64,
+        mediaType: String,
+        isLivePhoto: Bool,
+        motionVideoImmichID: String?
+    ) throws {
+        let subtypes = AssetSubtypes(isLivePhoto: isLivePhoto, hasPairedVideo: isLivePhoto)
+        try markImported(
+            uuid: uuid,
+            immichID: immichID,
+            filename: filename,
+            fileSize: fileSize,
+            mediaType: mediaType,
+            subtypes: subtypes,
+            motionVideoImmichID: motionVideoImmichID
+        )
     }
     
     public func getStats() -> (total: Int, photos: Int, videos: Int, totalBytes: Int64) {
@@ -441,10 +538,14 @@ public final class Tracker: @unchecked Sendable {
         }
     }
     
-    /// Check if a Live Photo has its motion video backed up
+    /// Check if an asset with paired video has its motion video backed up
+    /// Checks both is_live_photo and has_paired_video columns
     public func hasMotionVideoBackup(uuid: String) -> Bool {
         queue.sync {
-            let sql = "SELECT motion_video_immich_id FROM imported_assets WHERE icloud_uuid = ? AND is_live_photo = 1"
+            let sql = """
+                SELECT motion_video_immich_id FROM imported_assets 
+                WHERE icloud_uuid = ? AND (is_live_photo = 1 OR has_paired_video = 1)
+            """
             var stmt: OpaquePointer?
             
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -462,26 +563,49 @@ public final class Tracker: @unchecked Sendable {
         }
     }
     
-    /// Info about a Live Photo needing repair
-    public struct LivePhotoRepairInfo {
+    /// Check if an asset has a paired video resource (from tracker data)
+    public func hasPairedVideo(uuid: String) -> Bool {
+        queue.sync {
+            let sql = "SELECT has_paired_video FROM imported_assets WHERE icloud_uuid = ? LIMIT 1"
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return false
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
+            
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                return sqlite3_column_int(stmt, 0) == 1
+            }
+            return false
+        }
+    }
+    
+    /// Info about an asset needing paired video repair
+    public struct PairedVideoRepairInfo: Sendable {
         public let uuid: String
         public let immichID: String?
         public let filename: String
     }
     
-    /// Get Live Photos that were imported without their motion video (need repair)
-    /// These are assets where is_live_photo = 1 but motion_video_immich_id IS NULL
-    /// Also includes old imports where is_live_photo is NULL (unknown status)
-    public func getLivePhotosNeedingRepair() -> [LivePhotoRepairInfo] {
+    /// Alias for backward compatibility
+    public typealias LivePhotoRepairInfo = PairedVideoRepairInfo
+    
+    /// Get assets with paired video that were imported without their motion video (need repair)
+    /// This includes:
+    /// - Assets where has_paired_video = 1 but motion_video_immich_id IS NULL
+    /// - Assets where is_live_photo = 1 but motion_video_immich_id IS NULL
+    /// - Old imports where is_live_photo IS NULL (unknown status, pre-migration)
+    public func getAssetsNeedingPairedVideoRepair() -> [PairedVideoRepairInfo] {
         queue.sync {
-            var results: [LivePhotoRepairInfo] = []
+            var results: [PairedVideoRepairInfo] = []
             
-            // Find assets that are known Live Photos without motion video backup
-            // OR assets with unknown Live Photo status (pre-migration imports)
             let sql = """
                 SELECT icloud_uuid, immich_id, filename FROM imported_assets 
-                WHERE (is_live_photo = 1 AND motion_video_immich_id IS NULL)
-                   OR is_live_photo IS NULL
+                WHERE ((has_paired_video = 1 OR is_live_photo = 1) AND motion_video_immich_id IS NULL)
+                   OR (is_live_photo IS NULL AND has_paired_video IS NULL)
                 ORDER BY imported_at ASC
             """
             var stmt: OpaquePointer?
@@ -509,11 +633,16 @@ public final class Tracker: @unchecked Sendable {
                     filename = ""
                 }
                 
-                results.append(LivePhotoRepairInfo(uuid: uuid, immichID: immichID, filename: filename))
+                results.append(PairedVideoRepairInfo(uuid: uuid, immichID: immichID, filename: filename))
             }
             
             return results
         }
+    }
+    
+    /// Alias for backward compatibility
+    public func getLivePhotosNeedingRepair() -> [PairedVideoRepairInfo] {
+        return getAssetsNeedingPairedVideoRepair()
     }
     
     /// Update an existing asset to mark it as a Live Photo with motion video
@@ -568,7 +697,119 @@ public final class Tracker: @unchecked Sendable {
 
         return (total, withMotionVideo, needingRepair)
     }
-
+    
+    /// Get count of assets with paired video and their backup status
+    public func getPairedVideoStats() -> (total: Int, withMotionVideo: Int, needingRepair: Int) {
+        var total = 0
+        var withMotionVideo = 0
+        var needingRepair = 0
+        
+        // Total with paired video (includes Live Photos)
+        if let count = querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE has_paired_video = 1 OR is_live_photo = 1") {
+            total = count
+        }
+        
+        // With motion video backup
+        if let count = querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE (has_paired_video = 1 OR is_live_photo = 1) AND motion_video_immich_id IS NOT NULL") {
+            withMotionVideo = count
+        }
+        
+        // Needing repair
+        if let count = querySingleInt("""
+            SELECT COUNT(*) FROM imported_assets 
+            WHERE ((has_paired_video = 1 OR is_live_photo = 1) AND motion_video_immich_id IS NULL)
+               OR (is_live_photo IS NULL AND has_paired_video IS NULL)
+        """) {
+            needingRepair = count
+        }
+        
+        return (total, withMotionVideo, needingRepair)
+    }
+    
+    /// Get subtype statistics
+    public func getSubtypeStats() -> (portrait: Int, hdr: Int, panorama: Int, screenshot: Int, cinematic: Int, slomo: Int, timelapse: Int, spatialVideo: Int, proraw: Int) {
+        return (
+            portrait: querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE is_portrait = 1") ?? 0,
+            hdr: querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE is_hdr = 1") ?? 0,
+            panorama: querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE is_panorama = 1") ?? 0,
+            screenshot: querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE is_screenshot = 1") ?? 0,
+            cinematic: querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE is_cinematic = 1") ?? 0,
+            slomo: querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE is_slomo = 1") ?? 0,
+            timelapse: querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE is_timelapse = 1") ?? 0,
+            spatialVideo: querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE is_spatial_video = 1") ?? 0,
+            proraw: querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE is_proraw = 1") ?? 0
+        )
+    }
+    
+    /// Update an asset's paired video info
+    public func updatePairedVideoInfo(uuid: String, hasPairedVideo: Bool, motionVideoImmichID: String?) throws {
+        try queue.sync {
+            let sql = "UPDATE imported_assets SET has_paired_video = ?, motion_video_immich_id = ? WHERE icloud_uuid = ?"
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw TrackerError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            sqlite3_bind_int(stmt, 1, hasPairedVideo ? 1 : 0)
+            if let motionVideoImmichID = motionVideoImmichID {
+                sqlite3_bind_text(stmt, 2, motionVideoImmichID, -1, SQLITE_TRANSIENT)
+            } else {
+                sqlite3_bind_null(stmt, 2)
+            }
+            sqlite3_bind_text(stmt, 3, uuid, -1, SQLITE_TRANSIENT)
+            
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
+            }
+        }
+    }
+    
+    /// Update all subtype flags for an asset (preserves other data like immich_id, filename, etc.)
+    public func updateSubtypes(uuid: String, subtypes: AssetSubtypes) throws {
+        try queue.sync {
+            let sql = """
+                UPDATE imported_assets SET 
+                    is_live_photo = ?,
+                    is_portrait = ?,
+                    is_hdr = ?,
+                    is_panorama = ?,
+                    is_screenshot = ?,
+                    is_cinematic = ?,
+                    is_slomo = ?,
+                    is_timelapse = ?,
+                    is_spatial_video = ?,
+                    is_proraw = ?,
+                    has_paired_video = ?
+                WHERE icloud_uuid = ?
+            """
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw TrackerError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            sqlite3_bind_int(stmt, 1, subtypes.isLivePhoto ? 1 : 0)
+            sqlite3_bind_int(stmt, 2, subtypes.isPortrait ? 1 : 0)
+            sqlite3_bind_int(stmt, 3, subtypes.isHDR ? 1 : 0)
+            sqlite3_bind_int(stmt, 4, subtypes.isPanorama ? 1 : 0)
+            sqlite3_bind_int(stmt, 5, subtypes.isScreenshot ? 1 : 0)
+            sqlite3_bind_int(stmt, 6, subtypes.isCinematic ? 1 : 0)
+            sqlite3_bind_int(stmt, 7, subtypes.isSlomo ? 1 : 0)
+            sqlite3_bind_int(stmt, 8, subtypes.isTimelapse ? 1 : 0)
+            sqlite3_bind_int(stmt, 9, subtypes.isSpatialVideo ? 1 : 0)
+            sqlite3_bind_int(stmt, 10, subtypes.isProRAW ? 1 : 0)
+            sqlite3_bind_int(stmt, 11, subtypes.hasPairedVideo ? 1 : 0)
+            sqlite3_bind_text(stmt, 12, uuid, -1, SQLITE_TRANSIENT)
+            
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
+            }
+        }
+    }
+    
     // MARK: - Cinematic Video Support
 
     /// Check if an asset is a Cinematic video
@@ -647,7 +888,7 @@ public final class Tracker: @unchecked Sendable {
     }
 
     /// Info about a Cinematic video needing repair (imported without sidecars)
-    public struct CinematicRepairInfo {
+    public struct CinematicRepairInfo: Sendable {
         public let uuid: String
         public let immichID: String?
         public let filename: String
