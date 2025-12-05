@@ -1,1 +1,0 @@
-# DAM - Digital Asset Manager
