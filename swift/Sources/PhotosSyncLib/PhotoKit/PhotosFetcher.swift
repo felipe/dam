@@ -12,7 +12,21 @@ public final class PhotosFetcher: Sendable {
         public let creationDate: Date?
         public let modificationDate: Date?
         public let isLocal: Bool  // Original is available locally
-        public let isLivePhoto: Bool  // Contains paired video component
+        
+        // Subtypes (from PHAssetMediaSubtype flags)
+        public let isLivePhoto: Bool       // .photoLive
+        public let isPortrait: Bool        // .photoDepthEffect
+        public let isHDR: Bool             // .photoHDR
+        public let isPanorama: Bool        // .photoPanorama
+        public let isScreenshot: Bool      // .photoScreenshot
+        public let isCinematic: Bool       // .videoCinematic
+        public let isSlomo: Bool           // .videoHighFrameRate
+        public let isTimelapse: Bool       // .videoTimelapse
+        public let isSpatialVideo: Bool    // subtype & 0x400000
+        public let isProRAW: Bool          // UTI = com.adobe.raw-image
+        
+        // Key field - from actual resource check, not subtype
+        public let hasPairedVideo: Bool    // Has .pairedVideo resource (type 9)
     }
     
     public struct DownloadResult: Sendable {
@@ -35,8 +49,8 @@ public final class PhotosFetcher: Sendable {
         }
     }
     
-    /// Result of downloading a Live Photo (image + paired video)
-    public struct LivePhotoDownloadResult: Sendable {
+    /// Result of downloading an asset with paired video (Live Photo, etc.)
+    public struct PairedAssetDownloadResult: Sendable {
         public let localIdentifier: String
         public let imageResult: DownloadResult
         public let videoResult: DownloadResult?  // nil if video export failed
@@ -44,6 +58,9 @@ public final class PhotosFetcher: Sendable {
         public var success: Bool { imageResult.success }
         public var hasVideo: Bool { videoResult?.success ?? false }
     }
+    
+    /// Alias for backward compatibility
+    public typealias LivePhotoDownloadResult = PairedAssetDownloadResult
     
     /// Request Photos library access
     public static func requestAccess() async -> Bool {
@@ -94,8 +111,23 @@ public final class PhotosFetcher: Sendable {
                 filename = "\(asset.localIdentifier.replacingOccurrences(of: "/", with: "_")).\(ext)"
             }
             
-            // Detect Live Photo via mediaSubtypes
-            let isLivePhoto = asset.mediaSubtypes.contains(.photoLive)
+            // Extract subtypes from PHAssetMediaSubtype flags
+            let subtypes = asset.mediaSubtypes
+            let isLivePhoto = subtypes.contains(.photoLive)
+            let isPortrait = subtypes.contains(.photoDepthEffect)
+            let isHDR = subtypes.contains(.photoHDR)
+            let isPanorama = subtypes.contains(.photoPanorama)
+            let isScreenshot = subtypes.contains(.photoScreenshot)
+            let isCinematic = subtypes.contains(.videoCinematic)
+            let isSlomo = subtypes.contains(.videoHighFrameRate)
+            let isTimelapse = subtypes.contains(.videoTimelapse)
+            let isSpatialVideo = (subtypes.rawValue & 0x400000) != 0
+            
+            // Check for ProRAW (DNG format)
+            let isProRAW = resources.contains { $0.uniformTypeIdentifier == "com.adobe.raw-image" }
+            
+            // Check for actual paired video resource (type 9)
+            let hasPairedVideo = resources.contains { $0.type == .pairedVideo }
             
             assets.append(AssetInfo(
                 localIdentifier: asset.localIdentifier,
@@ -103,8 +135,18 @@ public final class PhotosFetcher: Sendable {
                 mediaType: asset.mediaType,
                 creationDate: asset.creationDate,
                 modificationDate: asset.modificationDate,
-                isLocal: false,  // Will check lazily during download
-                isLivePhoto: isLivePhoto
+                isLocal: false,
+                isLivePhoto: isLivePhoto,
+                isPortrait: isPortrait,
+                isHDR: isHDR,
+                isPanorama: isPanorama,
+                isScreenshot: isScreenshot,
+                isCinematic: isCinematic,
+                isSlomo: isSlomo,
+                isTimelapse: isTimelapse,
+                isSpatialVideo: isSpatialVideo,
+                isProRAW: isProRAW,
+                hasPairedVideo: hasPairedVideo
             ))
         }
         
@@ -292,13 +334,14 @@ public final class PhotosFetcher: Sendable {
         return (asset.creationDate, asset.modificationDate)
     }
     
-    /// Download a Live Photo asset - exports both image and paired video
-    public static func downloadLivePhotoAsset(
+    /// Download an asset with paired video - exports both image and paired video
+    /// Works for Live Photos and other assets with .pairedVideo resource
+    public static func downloadPairedAsset(
         identifier: String,
         to stagingDir: URL,
         timeout: TimeInterval = 300,
         allowNetwork: Bool = true
-    ) async -> LivePhotoDownloadResult {
+    ) async -> PairedAssetDownloadResult {
         // First, download the image using the standard method
         let imageResult = await downloadAsset(
             identifier: identifier,
@@ -309,7 +352,7 @@ public final class PhotosFetcher: Sendable {
         
         // If image download failed, return early
         guard imageResult.success else {
-            return LivePhotoDownloadResult(
+            return PairedAssetDownloadResult(
                 localIdentifier: identifier,
                 imageResult: imageResult,
                 videoResult: nil
@@ -324,14 +367,29 @@ public final class PhotosFetcher: Sendable {
             allowNetwork: allowNetwork
         )
         
-        return LivePhotoDownloadResult(
+        return PairedAssetDownloadResult(
             localIdentifier: identifier,
             imageResult: imageResult,
             videoResult: videoResult
         )
     }
     
-    /// Download just the paired video component of a Live Photo
+    /// Alias for backward compatibility
+    public static func downloadLivePhotoAsset(
+        identifier: String,
+        to stagingDir: URL,
+        timeout: TimeInterval = 300,
+        allowNetwork: Bool = true
+    ) async -> PairedAssetDownloadResult {
+        return await downloadPairedAsset(
+            identifier: identifier,
+            to: stagingDir,
+            timeout: timeout,
+            allowNetwork: allowNetwork
+        )
+    }
+    
+    /// Download just the paired video component
     private static func downloadPairedVideo(
         identifier: String,
         to stagingDir: URL,
@@ -444,7 +502,7 @@ public final class PhotosFetcher: Sendable {
         }
     }
     
-    /// Check if a Live Photo has a paired video resource available
+    /// Check if an asset has a paired video resource available
     public static func hasPairedVideoResource(identifier: String) -> Bool {
         let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
         guard let asset = fetchResult.firstObject else { return false }
