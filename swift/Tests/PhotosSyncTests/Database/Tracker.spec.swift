@@ -169,4 +169,226 @@ struct TrackerSpec {
         
         #expect(tracker.getImportedUUIDs().count == 1)
     }
+    
+    // MARK: - Live Photo Tests
+    
+    @Test("Marks Live Photo with motion video")
+    func markLivePhotoWithMotionVideo() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        let uuid = "live-photo-1"
+        let motionVideoID = "motion-video-immich-id"
+        
+        try tracker.markImported(
+            uuid: uuid,
+            immichID: "photo-immich-id",
+            filename: "live.heic",
+            fileSize: 2000,
+            mediaType: "photo",
+            isLivePhoto: true,
+            motionVideoImmichID: motionVideoID
+        )
+        
+        #expect(tracker.isLivePhoto(uuid: uuid) == true)
+        #expect(tracker.hasMotionVideoBackup(uuid: uuid) == true)
+        #expect(tracker.getMotionVideoImmichID(uuid: uuid) == motionVideoID)
+    }
+    
+    @Test("Marks Live Photo without motion video")
+    func markLivePhotoWithoutMotionVideo() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        let uuid = "live-photo-no-video"
+        
+        try tracker.markImported(
+            uuid: uuid,
+            immichID: "photo-id",
+            filename: "live.heic",
+            fileSize: 1500,
+            mediaType: "photo",
+            isLivePhoto: true,
+            motionVideoImmichID: nil
+        )
+        
+        #expect(tracker.isLivePhoto(uuid: uuid) == true)
+        #expect(tracker.hasMotionVideoBackup(uuid: uuid) == false)
+        #expect(tracker.getMotionVideoImmichID(uuid: uuid) == nil)
+    }
+    
+    @Test("Regular photo is not a Live Photo")
+    func regularPhotoNotLivePhoto() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        let uuid = "regular-photo"
+        
+        try tracker.markImported(
+            uuid: uuid,
+            immichID: "photo-id",
+            filename: "regular.jpg",
+            fileSize: 1000,
+            mediaType: "photo",
+            isLivePhoto: false,
+            motionVideoImmichID: nil
+        )
+        
+        #expect(tracker.isLivePhoto(uuid: uuid) == false)
+        #expect(tracker.hasMotionVideoBackup(uuid: uuid) == false)
+    }
+    
+    @Test("getLivePhotosNeedingRepair finds Live Photos without video")
+    func getLivePhotosNeedingRepair() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        // Live Photo with motion video - should NOT need repair
+        try tracker.markImported(
+            uuid: "complete-live",
+            immichID: "i1",
+            filename: "complete.heic",
+            fileSize: 2000,
+            mediaType: "photo",
+            isLivePhoto: true,
+            motionVideoImmichID: "motion-1"
+        )
+        
+        // Live Photo without motion video - SHOULD need repair
+        try tracker.markImported(
+            uuid: "incomplete-live",
+            immichID: "i2",
+            filename: "incomplete.heic",
+            fileSize: 1500,
+            mediaType: "photo",
+            isLivePhoto: true,
+            motionVideoImmichID: nil
+        )
+        
+        // Regular photo - should NOT need repair
+        try tracker.markImported(
+            uuid: "regular",
+            immichID: "i3",
+            filename: "regular.jpg",
+            fileSize: 1000,
+            mediaType: "photo",
+            isLivePhoto: false,
+            motionVideoImmichID: nil
+        )
+        
+        let needingRepair = tracker.getLivePhotosNeedingRepair()
+        
+        #expect(needingRepair.count == 1)
+        #expect(needingRepair[0].uuid == "incomplete-live")
+        #expect(needingRepair[0].immichID == "i2")
+        #expect(needingRepair[0].filename == "incomplete.heic")
+    }
+    
+    @Test("updateLivePhotoInfo updates existing asset")
+    func updateLivePhotoInfo() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        let uuid = "update-live-photo"
+        
+        // Initially import without Live Photo info
+        try tracker.markImported(
+            uuid: uuid,
+            immichID: "photo-id",
+            filename: "photo.heic",
+            fileSize: 2000,
+            mediaType: "photo"
+        )
+        
+        #expect(tracker.isLivePhoto(uuid: uuid) == false)
+        #expect(tracker.hasMotionVideoBackup(uuid: uuid) == false)
+        
+        // Update with Live Photo info
+        try tracker.updateLivePhotoInfo(
+            uuid: uuid,
+            isLivePhoto: true,
+            motionVideoImmichID: "motion-video-id"
+        )
+        
+        #expect(tracker.isLivePhoto(uuid: uuid) == true)
+        #expect(tracker.hasMotionVideoBackup(uuid: uuid) == true)
+        #expect(tracker.getMotionVideoImmichID(uuid: uuid) == "motion-video-id")
+    }
+    
+    @Test("getLivePhotoStats returns correct counts")
+    func getLivePhotoStats() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        // Complete Live Photo
+        try tracker.markImported(
+            uuid: "live-1",
+            immichID: "i1",
+            filename: "a.heic",
+            fileSize: 2000,
+            mediaType: "photo",
+            isLivePhoto: true,
+            motionVideoImmichID: "motion-1"
+        )
+        
+        // Complete Live Photo
+        try tracker.markImported(
+            uuid: "live-2",
+            immichID: "i2",
+            filename: "b.heic",
+            fileSize: 2000,
+            mediaType: "photo",
+            isLivePhoto: true,
+            motionVideoImmichID: "motion-2"
+        )
+        
+        // Incomplete Live Photo (no motion video)
+        try tracker.markImported(
+            uuid: "live-3",
+            immichID: "i3",
+            filename: "c.heic",
+            fileSize: 1500,
+            mediaType: "photo",
+            isLivePhoto: true,
+            motionVideoImmichID: nil
+        )
+        
+        // Regular photo
+        try tracker.markImported(
+            uuid: "regular",
+            immichID: "i4",
+            filename: "d.jpg",
+            fileSize: 1000,
+            mediaType: "photo",
+            isLivePhoto: false,
+            motionVideoImmichID: nil
+        )
+        
+        let stats = tracker.getLivePhotoStats()
+        
+        #expect(stats.total == 3)  // 3 Live Photos
+        #expect(stats.withMotionVideo == 2)  // 2 with motion video
+        #expect(stats.needingRepair == 1)  // 1 without motion video
+    }
+    
+    @Test("Migration adds Live Photo columns to existing database")
+    func migrationAddsLivePhotoColumns() throws {
+        // Create tracker - migration runs on init
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        // Import using new columns should work
+        try tracker.markImported(
+            uuid: "test",
+            immichID: "i1",
+            filename: "test.heic",
+            fileSize: 1000,
+            mediaType: "photo",
+            isLivePhoto: true,
+            motionVideoImmichID: "motion-id"
+        )
+        
+        #expect(tracker.isLivePhoto(uuid: "test") == true)
+        #expect(tracker.getMotionVideoImmichID(uuid: "test") == "motion-id")
+    }
 }
