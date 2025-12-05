@@ -12,6 +12,7 @@ public final class PhotosFetcher: Sendable {
         public let creationDate: Date?
         public let modificationDate: Date?
         public let isLocal: Bool  // Original is available locally
+        public let isLivePhoto: Bool  // Contains paired video component
     }
     
     public struct DownloadResult: Sendable {
@@ -23,6 +24,25 @@ public final class PhotosFetcher: Sendable {
         public let error: String?
         
         public var success: Bool { fileURL != nil }
+        
+        public init(localIdentifier: String, filename: String, fileURL: URL?, fileSize: Int64, mediaType: String, error: String?) {
+            self.localIdentifier = localIdentifier
+            self.filename = filename
+            self.fileURL = fileURL
+            self.fileSize = fileSize
+            self.mediaType = mediaType
+            self.error = error
+        }
+    }
+    
+    /// Result of downloading a Live Photo (image + paired video)
+    public struct LivePhotoDownloadResult: Sendable {
+        public let localIdentifier: String
+        public let imageResult: DownloadResult
+        public let videoResult: DownloadResult?  // nil if video export failed
+        
+        public var success: Bool { imageResult.success }
+        public var hasVideo: Bool { videoResult?.success ?? false }
     }
     
     /// Request Photos library access
@@ -74,13 +94,17 @@ public final class PhotosFetcher: Sendable {
                 filename = "\(asset.localIdentifier.replacingOccurrences(of: "/", with: "_")).\(ext)"
             }
             
+            // Detect Live Photo via mediaSubtypes
+            let isLivePhoto = asset.mediaSubtypes.contains(.photoLive)
+            
             assets.append(AssetInfo(
                 localIdentifier: asset.localIdentifier,
                 filename: filename,
                 mediaType: asset.mediaType,
                 creationDate: asset.creationDate,
                 modificationDate: asset.modificationDate,
-                isLocal: false  // Will check lazily during download
+                isLocal: false,  // Will check lazily during download
+                isLivePhoto: isLivePhoto
             ))
         }
         
@@ -266,6 +290,167 @@ public final class PhotosFetcher: Sendable {
             return (nil, nil)
         }
         return (asset.creationDate, asset.modificationDate)
+    }
+    
+    /// Download a Live Photo asset - exports both image and paired video
+    public static func downloadLivePhotoAsset(
+        identifier: String,
+        to stagingDir: URL,
+        timeout: TimeInterval = 300,
+        allowNetwork: Bool = true
+    ) async -> LivePhotoDownloadResult {
+        // First, download the image using the standard method
+        let imageResult = await downloadAsset(
+            identifier: identifier,
+            to: stagingDir,
+            timeout: timeout,
+            allowNetwork: allowNetwork
+        )
+        
+        // If image download failed, return early
+        guard imageResult.success else {
+            return LivePhotoDownloadResult(
+                localIdentifier: identifier,
+                imageResult: imageResult,
+                videoResult: nil
+            )
+        }
+        
+        // Now try to export the paired video
+        let videoResult = await downloadPairedVideo(
+            identifier: identifier,
+            to: stagingDir,
+            timeout: timeout,
+            allowNetwork: allowNetwork
+        )
+        
+        return LivePhotoDownloadResult(
+            localIdentifier: identifier,
+            imageResult: imageResult,
+            videoResult: videoResult
+        )
+    }
+    
+    /// Download just the paired video component of a Live Photo
+    private static func downloadPairedVideo(
+        identifier: String,
+        to stagingDir: URL,
+        timeout: TimeInterval = 300,
+        allowNetwork: Bool = true
+    ) async -> DownloadResult {
+        // Fetch the asset
+        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+        guard let asset = fetchResult.firstObject else {
+            return DownloadResult(
+                localIdentifier: identifier,
+                filename: "unknown",
+                fileURL: nil,
+                fileSize: 0,
+                mediaType: "video",
+                error: "Asset not found"
+            )
+        }
+        
+        let resources = PHAssetResource.assetResources(for: asset)
+        
+        // Find the paired video resource
+        guard let videoResource = resources.first(where: { $0.type == .pairedVideo }) else {
+            return DownloadResult(
+                localIdentifier: identifier,
+                filename: "unknown",
+                fileURL: nil,
+                fileSize: 0,
+                mediaType: "video",
+                error: "No paired video resource found"
+            )
+        }
+        
+        // Generate video filename based on image filename
+        var videoFilename = videoResource.originalFilename
+        if videoFilename.isEmpty {
+            // Use identifier with _video suffix
+            videoFilename = "\(identifier.replacingOccurrences(of: "/", with: "_"))_video.mov"
+        }
+        let destURL = stagingDir.appendingPathComponent(videoFilename)
+        
+        // Remove existing file if present
+        try? FileManager.default.removeItem(at: destURL)
+        
+        let finalFilename = videoFilename
+        
+        return await withCheckedContinuation { continuation in
+            let options = PHAssetResourceRequestOptions()
+            options.isNetworkAccessAllowed = allowNetwork
+            
+            // Use a class to safely track completion state across closures
+            final class CompletionState: @unchecked Sendable {
+                var completed = false
+                let lock = NSLock()
+                
+                func tryComplete() -> Bool {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    if completed { return false }
+                    completed = true
+                    return true
+                }
+            }
+            let state = CompletionState()
+            
+            // Set up timeout
+            let timeoutWork = DispatchWorkItem { [state] in
+                guard state.tryComplete() else { return }
+                continuation.resume(returning: DownloadResult(
+                    localIdentifier: identifier,
+                    filename: finalFilename,
+                    fileURL: nil,
+                    fileSize: 0,
+                    mediaType: "video",
+                    error: "Download timed out after \(Int(timeout))s"
+                ))
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: timeoutWork)
+            
+            PHAssetResourceManager.default().writeData(
+                for: videoResource,
+                toFile: destURL,
+                options: options
+            ) { [state] error in
+                timeoutWork.cancel()
+                
+                guard state.tryComplete() else { return }
+                
+                if let error = error {
+                    continuation.resume(returning: DownloadResult(
+                        localIdentifier: identifier,
+                        filename: finalFilename,
+                        fileURL: nil,
+                        fileSize: 0,
+                        mediaType: "video",
+                        error: error.localizedDescription
+                    ))
+                } else {
+                    let fileSize = (try? FileManager.default.attributesOfItem(atPath: destURL.path)[.size] as? Int64) ?? 0
+                    continuation.resume(returning: DownloadResult(
+                        localIdentifier: identifier,
+                        filename: finalFilename,
+                        fileURL: destURL,
+                        fileSize: fileSize,
+                        mediaType: "video",
+                        error: nil
+                    ))
+                }
+            }
+        }
+    }
+    
+    /// Check if a Live Photo has a paired video resource available
+    public static func hasPairedVideoResource(identifier: String) -> Bool {
+        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+        guard let asset = fetchResult.firstObject else { return false }
+        
+        let resources = PHAssetResource.assetResources(for: asset)
+        return resources.contains { $0.type == .pairedVideo }
     }
     
     private static func mediaTypeString(_ type: PHAssetMediaType) -> String {

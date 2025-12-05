@@ -35,12 +35,15 @@ public final class ImmichClient: Sendable {
     }
     
     /// Upload an asset to Immich
+    /// - Parameters:
+    ///   - livePhotoVideoId: For Live Photos, the Immich ID of the already-uploaded video component
     public func uploadAsset(
         fileURL: URL,
         deviceAssetID: String,
         deviceID: String = "photos-sync",
         fileCreatedAt: Date?,
-        fileModifiedAt: Date?
+        fileModifiedAt: Date?,
+        livePhotoVideoId: String? = nil
     ) async -> UploadResult {
         guard let url = URL(string: "\(baseURL)/api/assets") else {
             return UploadResult(success: false, assetID: nil, duplicate: false, error: "Invalid URL")
@@ -80,6 +83,13 @@ public final class ImmichClient: Sendable {
             body.append("--\(boundary)\r\n".data(using: .utf8)!)
             body.append("Content-Disposition: form-data; name=\"fileModifiedAt\"\r\n\r\n".data(using: .utf8)!)
             body.append("\(formatDate(modified))\r\n".data(using: .utf8)!)
+        }
+        
+        // Add livePhotoVideoId if this is a Live Photo image being linked to its video
+        if let livePhotoVideoId = livePhotoVideoId {
+            body.append("--\(boundary)\r\n".data(using: .utf8)!)
+            body.append("Content-Disposition: form-data; name=\"livePhotoVideoId\"\r\n\r\n".data(using: .utf8)!)
+            body.append("\(livePhotoVideoId)\r\n".data(using: .utf8)!)
         }
         
         // Add file data
@@ -283,6 +293,51 @@ public final class ImmichClient: Sendable {
             return (response as? HTTPURLResponse)?.statusCode == 204
         } catch {
             return false
+        }
+    }
+    
+    public struct DeleteResult: Sendable {
+        public let success: Bool
+        public let deletedCount: Int
+        public let error: String?
+    }
+    
+    /// Delete assets from Immich (used for repair mode to replace incomplete Live Photos)
+    /// - Parameters:
+    ///   - ids: Array of Immich asset IDs to delete
+    ///   - force: If true, permanently deletes. If false, moves to trash.
+    public func deleteAssets(ids: [String], force: Bool = false) async -> DeleteResult {
+        guard !ids.isEmpty else {
+            return DeleteResult(success: true, deletedCount: 0, error: nil)
+        }
+        
+        guard let url = URL(string: "\(baseURL)/api/assets") else {
+            return DeleteResult(success: false, deletedCount: 0, error: "Invalid URL")
+        }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        let body: [String: Any] = [
+            "ids": ids,
+            "force": force
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        
+        do {
+            let (_, response) = try await session.data(for: request)
+            if let httpResponse = response as? HTTPURLResponse {
+                if httpResponse.statusCode == 204 {
+                    return DeleteResult(success: true, deletedCount: ids.count, error: nil)
+                } else {
+                    return DeleteResult(success: false, deletedCount: 0, error: "HTTP \(httpResponse.statusCode)")
+                }
+            }
+            return DeleteResult(success: false, deletedCount: 0, error: "Invalid response")
+        } catch {
+            return DeleteResult(success: false, deletedCount: 0, error: error.localizedDescription)
         }
     }
     
