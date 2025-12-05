@@ -146,6 +146,45 @@ public final class Tracker: @unchecked Sendable {
         indexSql = "CREATE INDEX IF NOT EXISTS idx_is_cinematic ON imported_assets(is_cinematic)"
         sqlite3_exec(db, indexSql, nil, nil, &errMsg)
         sqlite3_free(errMsg)
+        errMsg = nil
+        
+        // Migration 3: Add problem asset tracking columns
+        let problemColumns = getColumnNames(table: "imported_assets")
+        
+        if !problemColumns.contains("status") {
+            let sql = "ALTER TABLE imported_assets ADD COLUMN status TEXT DEFAULT 'imported'"
+            if sqlite3_exec(db, sql, nil, nil, &errMsg) != SQLITE_OK {
+                let error = errMsg.map { String(cString: $0) } ?? "Unknown error"
+                sqlite3_free(errMsg)
+                errMsg = nil
+                print("Migration warning (status): \(error)")
+            }
+        }
+        
+        if !problemColumns.contains("error_reason") {
+            let sql = "ALTER TABLE imported_assets ADD COLUMN error_reason TEXT"
+            if sqlite3_exec(db, sql, nil, nil, &errMsg) != SQLITE_OK {
+                let error = errMsg.map { String(cString: $0) } ?? "Unknown error"
+                sqlite3_free(errMsg)
+                errMsg = nil
+                print("Migration warning (error_reason): \(error)")
+            }
+        }
+        
+        if !problemColumns.contains("asset_created_at") {
+            let sql = "ALTER TABLE imported_assets ADD COLUMN asset_created_at TIMESTAMP"
+            if sqlite3_exec(db, sql, nil, nil, &errMsg) != SQLITE_OK {
+                let error = errMsg.map { String(cString: $0) } ?? "Unknown error"
+                sqlite3_free(errMsg)
+                errMsg = nil
+                print("Migration warning (asset_created_at): \(error)")
+            }
+        }
+        
+        // Create index for status queries
+        indexSql = "CREATE INDEX IF NOT EXISTS idx_status ON imported_assets(status)"
+        sqlite3_exec(db, indexSql, nil, nil, &errMsg)
+        sqlite3_free(errMsg)
     }
     
     private func getColumnNames(table: String) -> Set<String> {
@@ -260,11 +299,11 @@ public final class Tracker: @unchecked Sendable {
         try queue.sync {
             let sql = """
                 INSERT OR REPLACE INTO imported_assets 
-                (icloud_uuid, immich_id, filename, file_size, media_type, imported_at,
+                (icloud_uuid, immich_id, filename, file_size, media_type, imported_at, status, error_reason,
                  is_live_photo, is_portrait, is_hdr, is_panorama, is_screenshot,
                  is_cinematic, is_slomo, is_timelapse, is_spatial_video, is_proraw,
                  has_paired_video, motion_video_immich_id, cinematic_sidecars)
-                VALUES (?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, datetime('now'), 'imported', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
             var stmt: OpaquePointer?
 
@@ -965,6 +1004,218 @@ public final class Tracker: @unchecked Sendable {
         }
 
         return (total, withSidecars, needingRepair)
+    }
+    // MARK: - Problem Asset Tracking
+    
+    /// Information about a problem asset (failed or skipped)
+    public struct ProblemAsset: Sendable {
+        public let uuid: String
+        public let filename: String
+        public let mediaType: String
+        public let status: String        // "failed" or "skipped"
+        public let reason: String
+        public let createdAt: Date?      // When the asset was created in Photos
+        public let recordedAt: Date      // When we recorded this problem
+        
+        public init(uuid: String, filename: String, mediaType: String, status: String, reason: String, createdAt: Date?, recordedAt: Date) {
+            self.uuid = uuid
+            self.filename = filename
+            self.mediaType = mediaType
+            self.status = status
+            self.reason = reason
+            self.createdAt = createdAt
+            self.recordedAt = recordedAt
+        }
+    }
+    
+    /// Mark an asset as failed (couldn't import)
+    public func markFailed(
+        uuid: String,
+        filename: String,
+        mediaType: String,
+        reason: String,
+        createdAt: Date? = nil
+    ) throws {
+        try queue.sync {
+            let sql = """
+                INSERT OR REPLACE INTO imported_assets 
+                (icloud_uuid, filename, file_size, media_type, imported_at, status, error_reason, asset_created_at)
+                VALUES (?, ?, 0, ?, datetime('now'), 'failed', ?, ?)
+            """
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw TrackerError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 2, filename, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 3, mediaType, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 4, reason, -1, SQLITE_TRANSIENT)
+            
+            if let createdAt = createdAt {
+                let formatter = ISO8601DateFormatter()
+                sqlite3_bind_text(stmt, 5, formatter.string(from: createdAt), -1, SQLITE_TRANSIENT)
+            } else {
+                sqlite3_bind_null(stmt, 5)
+            }
+            
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
+            }
+        }
+    }
+    
+    /// Mark an asset as skipped (intentionally not imported)
+    public func markSkipped(
+        uuid: String,
+        filename: String,
+        mediaType: String,
+        reason: String,
+        createdAt: Date? = nil
+    ) throws {
+        try queue.sync {
+            let sql = """
+                INSERT OR REPLACE INTO imported_assets 
+                (icloud_uuid, filename, file_size, media_type, imported_at, status, error_reason, asset_created_at)
+                VALUES (?, ?, 0, ?, datetime('now'), 'skipped', ?, ?)
+            """
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw TrackerError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 2, filename, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 3, mediaType, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 4, reason, -1, SQLITE_TRANSIENT)
+            
+            if let createdAt = createdAt {
+                let formatter = ISO8601DateFormatter()
+                sqlite3_bind_text(stmt, 5, formatter.string(from: createdAt), -1, SQLITE_TRANSIENT)
+            } else {
+                sqlite3_bind_null(stmt, 5)
+            }
+            
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
+            }
+        }
+    }
+    
+    /// Get all problem assets (failed + skipped)
+    public func getProblemAssets() -> [ProblemAsset] {
+        queue.sync {
+            var results: [ProblemAsset] = []
+            
+            let sql = """
+                SELECT icloud_uuid, filename, media_type, status, error_reason, asset_created_at, imported_at
+                FROM imported_assets 
+                WHERE status IN ('failed', 'skipped')
+                ORDER BY imported_at DESC
+            """
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return results
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            let dateFormatter = ISO8601DateFormatter()
+            
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let uuidCStr = sqlite3_column_text(stmt, 0) else { continue }
+                let uuid = String(cString: uuidCStr)
+                
+                let filename = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+                let mediaType = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? "unknown"
+                let status = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "failed"
+                let reason = sqlite3_column_text(stmt, 4).map { String(cString: $0) } ?? ""
+                
+                var createdAt: Date? = nil
+                if let createdAtCStr = sqlite3_column_text(stmt, 5) {
+                    createdAt = dateFormatter.date(from: String(cString: createdAtCStr))
+                }
+                
+                var recordedAt = Date()
+                if let recordedAtCStr = sqlite3_column_text(stmt, 6) {
+                    // Parse SQLite datetime format
+                    let sqlFormatter = DateFormatter()
+                    sqlFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+                    sqlFormatter.timeZone = TimeZone(identifier: "UTC")
+                    if let parsed = sqlFormatter.date(from: String(cString: recordedAtCStr)) {
+                        recordedAt = parsed
+                    }
+                }
+                
+                results.append(ProblemAsset(
+                    uuid: uuid,
+                    filename: filename,
+                    mediaType: mediaType,
+                    status: status,
+                    reason: reason,
+                    createdAt: createdAt,
+                    recordedAt: recordedAt
+                ))
+            }
+            
+            return results
+        }
+    }
+    
+    /// Get only failed assets
+    public func getFailedAssets() -> [ProblemAsset] {
+        return getProblemAssets().filter { $0.status == "failed" }
+    }
+    
+    /// Get only skipped assets
+    public func getSkippedAssets() -> [ProblemAsset] {
+        return getProblemAssets().filter { $0.status == "skipped" }
+    }
+    
+    /// Get problem asset statistics
+    public func getProblemStats() -> (failed: Int, skipped: Int) {
+        let failed = querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE status = 'failed'") ?? 0
+        let skipped = querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE status = 'skipped'") ?? 0
+        return (failed, skipped)
+    }
+    
+    /// Check if an asset is marked as a problem (failed or skipped)
+    public func isProblem(uuid: String) -> Bool {
+        queue.sync {
+            let sql = "SELECT status FROM imported_assets WHERE icloud_uuid = ? AND status IN ('failed', 'skipped') LIMIT 1"
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return false
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
+            return sqlite3_step(stmt) == SQLITE_ROW
+        }
+    }
+    
+    /// Clear problem status for an asset (used before retry)
+    public func clearProblemStatus(uuid: String) throws {
+        try queue.sync {
+            let sql = "DELETE FROM imported_assets WHERE icloud_uuid = ? AND status IN ('failed', 'skipped')"
+            var stmt: OpaquePointer?
+            
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw TrackerError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            
+            sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
+            
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
+            }
+        }
     }
 }
 

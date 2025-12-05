@@ -583,13 +583,29 @@ struct ImportCommand: AsyncParsableCommand {
         )
         
         if !downloadResult.success {
-            print("  ERROR: \(downloadResult.error ?? "Download failed")")
+            let reason = downloadResult.error ?? "Download failed"
+            print("  ERROR: \(reason)")
+            try? tracker.markFailed(
+                uuid: asset.localIdentifier,
+                filename: asset.filename,
+                mediaType: mediaTypeString(asset.mediaType),
+                reason: reason,
+                createdAt: asset.creationDate
+            )
             await stats.incrementFailed()
             return
         }
         
         guard let fileURL = downloadResult.fileURL else {
-            print("  ERROR: No file URL")
+            let reason = "No file URL returned"
+            print("  ERROR: \(reason)")
+            try? tracker.markFailed(
+                uuid: asset.localIdentifier,
+                filename: asset.filename,
+                mediaType: mediaTypeString(asset.mediaType),
+                reason: reason,
+                createdAt: asset.creationDate
+            )
             await stats.incrementFailed()
             return
         }
@@ -641,7 +657,15 @@ struct ImportCommand: AsyncParsableCommand {
                 motionVideoImmichID: nil
             )
         } else {
-            print("  ERROR: \(uploadResult.error ?? "Upload failed")")
+            let reason = uploadResult.error ?? "Upload failed"
+            print("  ERROR: \(reason)")
+            try? tracker.markFailed(
+                uuid: asset.localIdentifier,
+                filename: downloadResult.filename,
+                mediaType: downloadResult.mediaType,
+                reason: reason,
+                createdAt: asset.creationDate
+            )
             await stats.incrementFailed()
         }
     }
@@ -669,13 +693,29 @@ struct ImportCommand: AsyncParsableCommand {
         
         // Check if image export succeeded
         if !livePhotoResult.success {
-            print("  ERROR: \(livePhotoResult.imageResult.error ?? "Image export failed")")
+            let reason = livePhotoResult.imageResult.error ?? "Image export failed"
+            print("  ERROR: \(reason)")
+            try? tracker.markFailed(
+                uuid: asset.localIdentifier,
+                filename: asset.filename,
+                mediaType: mediaTypeString(asset.mediaType),
+                reason: reason,
+                createdAt: asset.creationDate
+            )
             await stats.incrementFailed()
             return
         }
         
         guard let imageURL = livePhotoResult.imageResult.fileURL else {
-            print("  ERROR: No image file URL")
+            let reason = "No image file URL returned"
+            print("  ERROR: \(reason)")
+            try? tracker.markFailed(
+                uuid: asset.localIdentifier,
+                filename: asset.filename,
+                mediaType: mediaTypeString(asset.mediaType),
+                reason: reason,
+                createdAt: asset.creationDate
+            )
             await stats.incrementFailed()
             return
         }
@@ -769,7 +809,15 @@ struct ImportCommand: AsyncParsableCommand {
                 motionVideoImmichID: motionVideoImmichID
             )
         } else {
-            print("  ERROR: Image upload failed: \(imageUploadResult.error ?? "unknown")")
+            let reason = imageUploadResult.error ?? "Image upload failed"
+            print("  ERROR: \(reason)")
+            try? tracker.markFailed(
+                uuid: asset.localIdentifier,
+                filename: livePhotoResult.imageResult.filename,
+                mediaType: livePhotoResult.imageResult.mediaType,
+                reason: reason,
+                createdAt: asset.creationDate
+            )
             await stats.incrementFailed()
         }
     }
@@ -795,13 +843,29 @@ struct ImportCommand: AsyncParsableCommand {
 
         // Check if main video export succeeded
         if !cinematicResult.success {
-            print("  ERROR: \(cinematicResult.videoResult.error ?? "Video export failed")")
+            let reason = cinematicResult.videoResult.error ?? "Video export failed"
+            print("  ERROR: \(reason)")
+            try? tracker.markFailed(
+                uuid: asset.localIdentifier,
+                filename: asset.filename,
+                mediaType: "video",
+                reason: reason,
+                createdAt: asset.creationDate
+            )
             await stats.incrementFailed()
             return
         }
 
         guard let videoURL = cinematicResult.videoResult.fileURL else {
-            print("  ERROR: No video file URL")
+            let reason = "No video file URL returned"
+            print("  ERROR: \(reason)")
+            try? tracker.markFailed(
+                uuid: asset.localIdentifier,
+                filename: asset.filename,
+                mediaType: "video",
+                reason: reason,
+                createdAt: asset.creationDate
+            )
             await stats.incrementFailed()
             return
         }
@@ -890,7 +954,15 @@ struct ImportCommand: AsyncParsableCommand {
                 cinematicSidecars: sidecarFilenames.isEmpty ? nil : sidecarFilenames
             )
         } else {
-            print("  ERROR: Video upload failed: \(uploadResult.error ?? "unknown")")
+            let reason = uploadResult.error ?? "Video upload failed"
+            print("  ERROR: \(reason)")
+            try? tracker.markFailed(
+                uuid: asset.localIdentifier,
+                filename: cinematicResult.videoResult.filename,
+                mediaType: "video",
+                reason: reason,
+                createdAt: asset.creationDate
+            )
             await stats.incrementFailed()
         }
     }
@@ -1069,6 +1141,15 @@ struct ImportCommand: AsyncParsableCommand {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
         return formatter.string(fromByteCount: bytes)
+    }
+    
+    private func mediaTypeString(_ type: PHAssetMediaType) -> String {
+        switch type {
+        case .image: return "photo"
+        case .video: return "video"
+        case .audio: return "audio"
+        default: return "unknown"
+        }
     }
 }
 

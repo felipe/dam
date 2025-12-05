@@ -483,4 +483,143 @@ struct TrackerSpec {
         #expect(stats.screenshot == 0)
         #expect(stats.cinematic == 0)
     }
+    
+    // MARK: - Problem Asset Tracking Tests
+    
+    @Test("markFailed records failed asset")
+    func markFailed() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        let createdAt = Date()
+        try tracker.markFailed(
+            uuid: "failed-1",
+            filename: "failed.jpg",
+            mediaType: "photo",
+            reason: "Upload timeout",
+            createdAt: createdAt
+        )
+        
+        let problems = tracker.getProblemAssets()
+        #expect(problems.count == 1)
+        #expect(problems[0].uuid == "failed-1")
+        #expect(problems[0].filename == "failed.jpg")
+        #expect(problems[0].status == "failed")
+        #expect(problems[0].reason == "Upload timeout")
+        #expect(problems[0].mediaType == "photo")
+    }
+    
+    @Test("markSkipped records skipped asset")
+    func markSkipped() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        try tracker.markSkipped(
+            uuid: "skipped-1",
+            filename: "cloud.jpg",
+            mediaType: "photo",
+            reason: "Asset in iCloud"
+        )
+        
+        let problems = tracker.getProblemAssets()
+        #expect(problems.count == 1)
+        #expect(problems[0].status == "skipped")
+        #expect(problems[0].reason == "Asset in iCloud")
+    }
+    
+    @Test("getFailedAssets returns only failed")
+    func getFailedAssets() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        try tracker.markFailed(uuid: "f1", filename: "f.jpg", mediaType: "photo", reason: "error1")
+        try tracker.markSkipped(uuid: "s1", filename: "s.jpg", mediaType: "photo", reason: "skip1")
+        try tracker.markFailed(uuid: "f2", filename: "f2.jpg", mediaType: "photo", reason: "error2")
+        
+        let failed = tracker.getFailedAssets()
+        #expect(failed.count == 2)
+        #expect(failed.allSatisfy { $0.status == "failed" })
+    }
+    
+    @Test("getSkippedAssets returns only skipped")
+    func getSkippedAssets() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        try tracker.markFailed(uuid: "f1", filename: "f.jpg", mediaType: "photo", reason: "error1")
+        try tracker.markSkipped(uuid: "s1", filename: "s.jpg", mediaType: "photo", reason: "skip1")
+        try tracker.markSkipped(uuid: "s2", filename: "s2.jpg", mediaType: "photo", reason: "skip2")
+        
+        let skipped = tracker.getSkippedAssets()
+        #expect(skipped.count == 2)
+        #expect(skipped.allSatisfy { $0.status == "skipped" })
+    }
+    
+    @Test("getProblemStats returns correct counts")
+    func getProblemStats() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        try tracker.markFailed(uuid: "f1", filename: "f.jpg", mediaType: "photo", reason: "err")
+        try tracker.markFailed(uuid: "f2", filename: "f2.jpg", mediaType: "photo", reason: "err")
+        try tracker.markSkipped(uuid: "s1", filename: "s.jpg", mediaType: "photo", reason: "skip")
+        
+        let stats = tracker.getProblemStats()
+        #expect(stats.failed == 2)
+        #expect(stats.skipped == 1)
+    }
+    
+    @Test("isProblem returns true for failed/skipped assets")
+    func isProblem() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        try tracker.markFailed(uuid: "failed-1", filename: "f.jpg", mediaType: "photo", reason: "err")
+        try tracker.markSkipped(uuid: "skipped-1", filename: "s.jpg", mediaType: "photo", reason: "skip")
+        
+        #expect(tracker.isProblem(uuid: "failed-1") == true)
+        #expect(tracker.isProblem(uuid: "skipped-1") == true)
+        #expect(tracker.isProblem(uuid: "nonexistent") == false)
+    }
+    
+    @Test("clearProblemStatus removes failed status")
+    func clearProblemStatus() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        try tracker.markFailed(uuid: "f1", filename: "f.jpg", mediaType: "photo", reason: "err")
+        
+        #expect(tracker.isProblem(uuid: "f1") == true)
+        
+        try tracker.clearProblemStatus(uuid: "f1")
+        
+        #expect(tracker.isProblem(uuid: "f1") == false)
+    }
+    
+    @Test("markImported overwrites failed status on success")
+    func markImportedOverwritesFailed() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+        
+        // First fail
+        try tracker.markFailed(uuid: "retry-1", filename: "r.jpg", mediaType: "photo", reason: "first attempt failed")
+        #expect(tracker.isProblem(uuid: "retry-1") == true)
+        
+        // Then succeed
+        try tracker.markImported(
+            uuid: "retry-1",
+            immichID: "immich-123",
+            filename: "r.jpg",
+            fileSize: 1000,
+            mediaType: "photo"
+        )
+        
+        // Should no longer be a problem
+        #expect(tracker.isProblem(uuid: "retry-1") == false)
+        #expect(tracker.isImported(uuid: "retry-1") == true)
+        
+        // Problem stats should not include this asset
+        let stats = tracker.getProblemStats()
+        #expect(stats.failed == 0)
+    }
 }
