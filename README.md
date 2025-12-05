@@ -9,8 +9,8 @@ A tool for migrating photos and videos from Apple Photos/iCloud to [Immich](http
 - **Cinematic Video Support**: Backs up all components including depth track and AAE sidecars
 - **Special Media Tracking**: Detects and tracks Portrait, HDR, Panorama, Slo-mo, Timelapse, Spatial Video, ProRAW
 - **Incremental Sync**: Tracks imported assets to avoid duplicates
-- **iCloud Integration**: Can download assets stored in iCloud
-- **Repair Tools**: Fix previously imported assets that are missing components
+- **iCloud Support**: Can attempt to download assets stored in iCloud when requested
+- **Repair Tools**: Verify and fix assets that may not have synced correctly
 
 ## Setup
 
@@ -73,7 +73,7 @@ photos-sync import --concurrency 3 --delay 2.0
 
 ### `photos-sync reclassify`
 
-Scan Photos library and update tracker database with current subtype information. Useful after the subtype tracking feature was added to fix historical imports.
+Scan Photos library and update tracker database with current subtype information.
 
 ```bash
 # Scan and update subtypes in tracker
@@ -116,8 +116,8 @@ The tracker database stores subtype flags for each imported asset:
 | Subtype | Detection | Notes |
 |---------|-----------|-------|
 | Live Photo | `.photoLive` subtype | Has paired video component |
-| Portrait | `.photoDepthEffect` subtype | Depth data stored differently, no paired video |
-| HDR | `.photoHDR` subtype | Exposure data embedded, no paired video |
+| Portrait | `.photoDepthEffect` subtype | |
+| HDR | `.photoHDR` subtype | |
 | Panorama | `.photoPanorama` subtype | |
 | Screenshot | `.photoScreenshot` subtype | |
 | Cinematic | `.videoCinematic` subtype | Has depth track + AAE sidecar |
@@ -126,8 +126,6 @@ The tracker database stores subtype flags for each imported asset:
 | Spatial Video | Raw subtype flag `0x400000` | Apple Vision Pro content |
 | ProRAW | UTI `com.adobe.raw-image` | DNG format |
 | Has Paired Video | `.pairedVideo` resource check | Actual resource, not subtype flag |
-
-**Key Discovery:** Portrait and HDR photos do NOT have paired video resources. Their depth/exposure data is stored differently (embedded in the file). Only Live Photos (and corrupted Live Photos that lost their subtype flag) have `.pairedVideo` resources.
 
 ## Data Storage
 
@@ -156,26 +154,24 @@ The `imported_assets` table tracks:
 - `motion_video_immich_id` - Linked motion video in Immich
 - `cinematic_sidecars` - JSON array of sidecar filenames
 
-## Repair Workflows
+## Repair Tools
 
-### Live Photos Missing Motion Video
+If you believe something didn't sync correctly, these tools can help verify and fix issues.
 
-If Live Photos were imported before motion video support was added:
+### Verify Live Photo Sync
 
 ```bash
-# Check how many need repair
+# Check status of paired video assets
 photos-sync reclassify
 
-# Repair them (re-uploads with proper video linking)
+# Re-sync Live Photos with their motion video
 photos-sync import --repair-paired-videos --include-cloud
 ```
 
-### Cinematic Videos Missing Sidecars
-
-If Cinematic videos were imported before sidecar support:
+### Verify Cinematic Video Sync
 
 ```bash
-# Export sidecars for existing Cinematic imports
+# Export sidecars for Cinematic videos
 photos-sync import --repair-cinematic --include-cloud
 ```
 
@@ -195,7 +191,7 @@ Apple Cinematic videos are fully backed up with all their components:
 
 When re-importing a Cinematic video to Photos.app via `PHAssetCreationRequest`, the video imports as a regular video - you cannot resume focus point editing. This is because:
 
-1. **Focus keyframes are in MOV metadata**, not the AAE file. While we preserve this data, Photos.app doesn't recognize re-imported files as Cinematic.
+1. **Focus keyframes are in MOV metadata**, not the AAE file. While this data is preserved, Photos.app doesn't recognize re-imported files as Cinematic.
 
 2. **Apple's ecosystem lock**: The Cinematic designation appears to require original capture metadata or private APIs that aren't exposed to third-party apps.
 
@@ -212,9 +208,4 @@ When re-importing a Cinematic video to Photos.app via `PHAssetCreationRequest`, 
 - All adjustment/edit history
 - Complete data for archival purposes
 
-This limitation is documented here so users understand that while Cinematic videos are fully backed up, restoring the interactive focus-editing experience requires the original in Apple Photos or using Final Cut Pro.
-
-## Components
-
-- `swift/` - Native macOS app using PhotoKit for Photos library access
-- `src/` - Python utilities for Immich API interaction (legacy)
+While Cinematic videos are fully backed up, restoring the interactive focus-editing experience requires the original in Apple Photos or using Final Cut Pro.
