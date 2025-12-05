@@ -27,12 +27,13 @@ struct ImportCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Delay between iCloud downloads in seconds")
     var delay: Double = 5.0
     
-    @Flag(name: .long, help: "Repair Live Photos that were imported without motion video")
-    var repairLivePhotos: Bool = false
+    @Flag(name: [.customLong("repair-paired-videos"), .customLong("repair-live-photos")], 
+          help: "Repair assets with paired video that were imported without motion video")
+    var repairPairedVideos: Bool = false
     
     func run() async throws {
         // Handle repair mode separately
-        if repairLivePhotos {
+        if repairPairedVideos {
             try await runRepairMode()
             return
         }
@@ -203,8 +204,8 @@ struct ImportCommand: AsyncParsableCommand {
         print("Uploaded:   \(formatNumber(finalStats.uploaded))")
         print("Duplicates: \(formatNumber(finalStats.duplicates))")
         print("Failed:     \(formatNumber(finalStats.failed))")
-        if finalStats.livePhotos > 0 {
-            print("Live Photos: \(formatNumber(finalStats.livePhotos)) (with \(formatNumber(finalStats.livePhotoVideos)) videos)")
+        if finalStats.pairedAssets > 0 {
+            print("Paired assets: \(formatNumber(finalStats.pairedAssets)) (with \(formatNumber(finalStats.pairedVideos)) videos)")
         }
         if dryRun {
             print("Skipped:    \(formatNumber(finalStats.skipped)) (dry run)")
@@ -244,42 +245,46 @@ struct ImportCommand: AsyncParsableCommand {
         // Load tracker
         let tracker = try Tracker(dbPath: config.trackerDBPath)
         
-        // Get stats on Live Photos
-        let livePhotoStats = tracker.getLivePhotoStats()
+        // Get stats on paired video assets
+        let pairedVideoStats = tracker.getPairedVideoStats()
         print()
-        print("Live Photo Status:")
-        print("  Total tracked:     \(formatNumber(livePhotoStats.total))")
-        print("  With motion video: \(formatNumber(livePhotoStats.withMotionVideo))")
-        print("  Needing repair:    \(formatNumber(livePhotoStats.needingRepair))")
+        print("Paired Video Status:")
+        print("  Total tracked:     \(formatNumber(pairedVideoStats.total))")
+        print("  With motion video: \(formatNumber(pairedVideoStats.withMotionVideo))")
+        print("  Needing repair:    \(formatNumber(pairedVideoStats.needingRepair))")
         print()
         
-        // Get Live Photos needing repair
-        let needingRepair = tracker.getLivePhotosNeedingRepair()
+        // Get assets needing paired video repair
+        let needingRepair = tracker.getAssetsNeedingPairedVideoRepair()
         
         if needingRepair.isEmpty {
-            print("No Live Photos need repair.")
+            print("No assets with paired video need repair.")
             return
         }
         
         // Get all Photos library assets to cross-reference
-        print("Loading Photos library to find Live Photos...")
+        print("Loading Photos library to find assets with paired video...")
         let allAssets = PhotosFetcher.getAllAssets()
         let assetMap = Dictionary(uniqueKeysWithValues: allAssets.map { ($0.localIdentifier, $0) })
         
-        // Filter to only those that are actually Live Photos in the library
-        var toRepair: [(info: Tracker.LivePhotoRepairInfo, asset: PhotosFetcher.AssetInfo)] = []
+        // Filter to only those that actually have paired video in the library
+        var toRepair: [(info: Tracker.PairedVideoRepairInfo, asset: PhotosFetcher.AssetInfo)] = []
         for info in needingRepair {
             guard let asset = assetMap[info.uuid] else {
                 // Asset no longer in library, skip
                 continue
             }
             
-            if asset.isLivePhoto {
+            if asset.hasPairedVideo {
+                // Skip Cinematic for now
+                if asset.isCinematic {
+                    continue
+                }
                 toRepair.append((info, asset))
             } else {
-                // Not actually a Live Photo - update tracker to mark as non-Live Photo
+                // No paired video - update tracker
                 if !dryRun {
-                    try? tracker.updateLivePhotoInfo(uuid: info.uuid, isLivePhoto: false, motionVideoImmichID: nil)
+                    try? tracker.updatePairedVideoInfo(uuid: info.uuid, hasPairedVideo: false, motionVideoImmichID: nil)
                 }
             }
         }
@@ -289,16 +294,16 @@ struct ImportCommand: AsyncParsableCommand {
             toRepair = Array(toRepair.prefix(limit))
         }
         
-        print("Live Photos to repair: \(formatNumber(toRepair.count))")
+        print("Assets with paired video to repair: \(formatNumber(toRepair.count))")
         
         if toRepair.isEmpty {
-            print("No Live Photos need repair after verification.")
+            print("No assets with paired video need repair after verification.")
             return
         }
         
         print()
         print(String(repeating: "=", count: 50))
-        print("REPAIRING \(formatNumber(toRepair.count)) LIVE PHOTOS")
+        print("REPAIRING \(formatNumber(toRepair.count)) PAIRED VIDEO ASSETS")
         print(String(repeating: "=", count: 50))
         print()
         
@@ -311,7 +316,7 @@ struct ImportCommand: AsyncParsableCommand {
             print("[\(num)/\(toRepair.count)] \(item.info.filename)")
             
             if dryRun {
-                print("  DRY RUN: Would repair Live Photo")
+                print("  DRY RUN: Would repair paired video asset")
                 skipped += 1
                 continue
             }
@@ -319,8 +324,8 @@ struct ImportCommand: AsyncParsableCommand {
             // Check if asset has paired video resource
             guard PhotosFetcher.hasPairedVideoResource(identifier: item.info.uuid) else {
                 print("  WARNING: No paired video in Photos library")
-                // Mark as non-Live Photo to prevent future repair attempts
-                try? tracker.updateLivePhotoInfo(uuid: item.info.uuid, isLivePhoto: false, motionVideoImmichID: nil)
+                // Mark as no paired video to prevent future repair attempts
+                try? tracker.updatePairedVideoInfo(uuid: item.info.uuid, hasPairedVideo: false, motionVideoImmichID: nil)
                 skipped += 1
                 continue
             }
@@ -413,13 +418,26 @@ struct ImportCommand: AsyncParsableCommand {
                 print("  Image uploaded: \(imageUploadResult.assetID ?? "unknown") (linked to video)")
                 
                 // Update tracker with the new info
+                let subtypes = Tracker.AssetSubtypes(
+                    isLivePhoto: item.asset.isLivePhoto,
+                    isPortrait: item.asset.isPortrait,
+                    isHDR: item.asset.isHDR,
+                    isPanorama: item.asset.isPanorama,
+                    isScreenshot: item.asset.isScreenshot,
+                    isCinematic: item.asset.isCinematic,
+                    isSlomo: item.asset.isSlomo,
+                    isTimelapse: item.asset.isTimelapse,
+                    isSpatialVideo: item.asset.isSpatialVideo,
+                    isProRAW: item.asset.isProRAW,
+                    hasPairedVideo: item.asset.hasPairedVideo
+                )
                 try? tracker.markImported(
                     uuid: item.info.uuid,
                     immichID: imageUploadResult.assetID,
                     filename: imageResult.filename,
                     fileSize: imageResult.fileSize,
                     mediaType: imageResult.mediaType,
-                    isLivePhoto: true,
+                    subtypes: subtypes,
                     motionVideoImmichID: videoImmichID
                 )
                 repaired += 1
@@ -492,8 +510,17 @@ struct ImportCommand: AsyncParsableCommand {
         allowNetwork: Bool
     ) async {
         let num = index + 1
-        let livePhotoLabel = asset.isLivePhoto ? " [Live]" : ""
-        print("[\(num)/\(total)] \(asset.filename)\(livePhotoLabel)")
+        var labels: [String] = []
+        if asset.isLivePhoto { labels.append("Live") }
+        if asset.isPortrait { labels.append("Portrait") }
+        if asset.isHDR { labels.append("HDR") }
+        if asset.isCinematic { labels.append("Cinematic") }
+        if asset.isSlomo { labels.append("Slomo") }
+        if asset.isSpatialVideo { labels.append("Spatial") }
+        if asset.isProRAW { labels.append("ProRAW") }
+        if asset.hasPairedVideo && !asset.isLivePhoto { labels.append("PairedVideo") }
+        let labelStr = labels.isEmpty ? "" : " [\(labels.joined(separator: ", "))]"
+        print("[\(num)/\(total)] \(asset.filename)\(labelStr)")
         
         if dryRun {
             print("  DRY RUN: Would download and upload")
@@ -504,9 +531,16 @@ struct ImportCommand: AsyncParsableCommand {
         // Get dates upfront
         let dates = PhotosFetcher.getAssetDates(identifier: asset.localIdentifier)
         
-        // Handle Live Photos with two-step upload
-        if asset.isLivePhoto {
-            await processLivePhoto(
+        // Skip Cinematic videos for now (need research - see issue #9)
+        if asset.isCinematic {
+            print("  Skipping Cinematic video (not yet supported, see issue #9)")
+            await stats.incrementSkipped()
+            return
+        }
+        
+        // Handle assets with paired video (Live Photos, etc.) with two-step upload
+        if asset.hasPairedVideo {
+            await processPairedAsset(
                 asset: asset,
                 dates: dates,
                 config: config,
@@ -566,14 +600,27 @@ struct ImportCommand: AsyncParsableCommand {
                 await stats.incrementUploaded()
             }
             
-            // Track as imported (not a Live Photo)
+            // Track as imported with all subtype info
+            let subtypes = Tracker.AssetSubtypes(
+                isLivePhoto: asset.isLivePhoto,
+                isPortrait: asset.isPortrait,
+                isHDR: asset.isHDR,
+                isPanorama: asset.isPanorama,
+                isScreenshot: asset.isScreenshot,
+                isCinematic: asset.isCinematic,
+                isSlomo: asset.isSlomo,
+                isTimelapse: asset.isTimelapse,
+                isSpatialVideo: asset.isSpatialVideo,
+                isProRAW: asset.isProRAW,
+                hasPairedVideo: asset.hasPairedVideo
+            )
             try? tracker.markImported(
                 uuid: asset.localIdentifier,
                 immichID: uploadResult.assetID,
                 filename: downloadResult.filename,
                 fileSize: downloadResult.fileSize,
                 mediaType: downloadResult.mediaType,
-                isLivePhoto: false,
+                subtypes: subtypes,
                 motionVideoImmichID: nil
             )
         } else {
@@ -582,8 +629,9 @@ struct ImportCommand: AsyncParsableCommand {
         }
     }
     
-    /// Process a Live Photo - uploads video first, then image linked to video
-    private func processLivePhoto(
+    /// Process an asset with paired video - uploads video first, then image linked to video
+    /// Works for Live Photos and other assets with .pairedVideo resource
+    private func processPairedAsset(
         asset: PhotosFetcher.AssetInfo,
         dates: (created: Date?, modified: Date?),
         config: Config,
@@ -592,10 +640,11 @@ struct ImportCommand: AsyncParsableCommand {
         stats: ImportStatsActor,
         allowNetwork: Bool
     ) async {
-        print("  Exporting Live Photo (image + video)...")
+        let assetType = asset.isLivePhoto ? "Live Photo" : "paired asset"
+        print("  Exporting \(assetType) (image + video)...")
         
         // Download both image and video
-        let livePhotoResult = await PhotosFetcher.downloadLivePhotoAsset(
+        let livePhotoResult = await PhotosFetcher.downloadPairedAsset(
             identifier: asset.localIdentifier,
             to: config.stagingDir,
             allowNetwork: allowNetwork
@@ -642,7 +691,7 @@ struct ImportCommand: AsyncParsableCommand {
                 } else {
                     print("  Video uploaded: \(videoUploadResult.assetID ?? "unknown")")
                 }
-                await stats.incrementLivePhotoVideos()
+                await stats.incrementPairedVideos()
             } else {
                 // Video upload failed, but we can still upload image without link
                 print("  WARNING: Video upload failed: \(videoUploadResult.error ?? "unknown")")
@@ -676,17 +725,30 @@ struct ImportCommand: AsyncParsableCommand {
                 let linkStatus = motionVideoImmichID != nil ? " (linked to video)" : " (no video link)"
                 print("  Image uploaded: \(imageUploadResult.assetID ?? "unknown")\(linkStatus)")
                 await stats.incrementUploaded()
-                await stats.incrementLivePhotos()
+                await stats.incrementPairedAssets()
             }
             
-            // Track as imported Live Photo
+            // Track as imported with all subtype info
+            let subtypes = Tracker.AssetSubtypes(
+                isLivePhoto: asset.isLivePhoto,
+                isPortrait: asset.isPortrait,
+                isHDR: asset.isHDR,
+                isPanorama: asset.isPanorama,
+                isScreenshot: asset.isScreenshot,
+                isCinematic: asset.isCinematic,
+                isSlomo: asset.isSlomo,
+                isTimelapse: asset.isTimelapse,
+                isSpatialVideo: asset.isSpatialVideo,
+                isProRAW: asset.isProRAW,
+                hasPairedVideo: asset.hasPairedVideo
+            )
             try? tracker.markImported(
                 uuid: asset.localIdentifier,
                 immichID: imageUploadResult.assetID,
                 filename: livePhotoResult.imageResult.filename,
                 fileSize: livePhotoResult.imageResult.fileSize,
                 mediaType: livePhotoResult.imageResult.mediaType,
-                isLivePhoto: true,
+                subtypes: subtypes,
                 motionVideoImmichID: motionVideoImmichID
             )
         } else {
@@ -715,18 +777,18 @@ actor ImportStatsActor {
     private var duplicates = 0
     private var failed = 0
     private var skipped = 0
-    private var livePhotos = 0
-    private var livePhotoVideos = 0
+    private var pairedAssets = 0
+    private var pairedVideos = 0
     
     func incrementExported() { exported += 1 }
     func incrementUploaded() { uploaded += 1 }
     func incrementDuplicates() { duplicates += 1 }
     func incrementFailed() { failed += 1 }
     func incrementSkipped() { skipped += 1 }
-    func incrementLivePhotos() { livePhotos += 1 }
-    func incrementLivePhotoVideos() { livePhotoVideos += 1 }
+    func incrementPairedAssets() { pairedAssets += 1 }
+    func incrementPairedVideos() { pairedVideos += 1 }
     
-    func getStats() -> (exported: Int, uploaded: Int, duplicates: Int, failed: Int, skipped: Int, livePhotos: Int, livePhotoVideos: Int) {
-        (exported, uploaded, duplicates, failed, skipped, livePhotos, livePhotoVideos)
+    func getStats() -> (exported: Int, uploaded: Int, duplicates: Int, failed: Int, skipped: Int, pairedAssets: Int, pairedVideos: Int) {
+        (exported, uploaded, duplicates, failed, skipped, pairedAssets, pairedVideos)
     }
 }

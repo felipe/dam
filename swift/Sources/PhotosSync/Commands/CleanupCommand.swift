@@ -59,32 +59,33 @@ struct CleanupCommand: AsyncParsableCommand {
         let photosUUIDs = Set(photosAssets.map { $0.localIdentifier })
         print("Assets in Photos: \(formatNumber(photosUUIDs.count))")
         
-        // Build a map of Photos assets for Live Photo detection
+        // Build a map of Photos assets for paired video detection
         let photosAssetMap = Dictionary(uniqueKeysWithValues: photosAssets.map { ($0.localIdentifier, $0) })
         
         // === PART 1: Deleted from Immich → Delete from Photos ===
         var toDeleteFromPhotos: [(uuid: String, immichID: String)] = []
-        var skippedLivePhotos = 0  // Live Photos without motion video backup
+        var skippedPairedAssets = 0  // Assets with paired video without motion video backup
         
         for uuid in importedUUIDs {
             if let immichID = tracker.getImmichIDForUUID(uuid) {
                 if !immichAssetIDs.contains(immichID) {
                     // This was imported but no longer exists in Immich
                     
-                    // SAFETY CHECK: For Live Photos, ensure motion video is backed up
-                    if let asset = photosAssetMap[uuid], asset.isLivePhoto {
+                    // SAFETY CHECK: For assets with paired video, ensure motion video is backed up
+                    if let asset = photosAssetMap[uuid], asset.hasPairedVideo {
                         // Check if we have the motion video backed up
                         if !tracker.hasMotionVideoBackup(uuid: uuid) {
-                            // Skip this Live Photo - motion video not backed up
+                            // Skip this asset - motion video not backed up
                             // Deleting it would lose the motion video forever
-                            skippedLivePhotos += 1
+                            skippedPairedAssets += 1
                             continue
                         }
                     }
                     
-                    // Also check tracker's Live Photo status for assets not in Photos library
-                    if tracker.isLivePhoto(uuid: uuid) && !tracker.hasMotionVideoBackup(uuid: uuid) {
-                        skippedLivePhotos += 1
+                    // Also check tracker's paired video status for assets not in Photos library
+                    if (tracker.isLivePhoto(uuid: uuid) || tracker.hasPairedVideo(uuid: uuid)) 
+                       && !tracker.hasMotionVideoBackup(uuid: uuid) {
+                        skippedPairedAssets += 1
                         continue
                     }
                     
@@ -126,9 +127,9 @@ struct CleanupCommand: AsyncParsableCommand {
         print(String(repeating: "=", count: 60))
         print("Delete from Photos (removed in Immich): \(formatNumber(toDeleteFromPhotos.count))")
         print("Archive in Immich (removed in Photos):  \(formatNumber(toArchiveInImmich.count))")
-        if skippedLivePhotos > 0 {
-            print("Skipped Live Photos (no motion video):  \(formatNumber(skippedLivePhotos))")
-            print("  Run 'import --repair-live-photos' first to backup motion videos")
+        if skippedPairedAssets > 0 {
+            print("Skipped paired assets (no motion video): \(formatNumber(skippedPairedAssets))")
+            print("  Run 'import --repair-paired-videos' first to backup motion videos")
         }
         print()
         
