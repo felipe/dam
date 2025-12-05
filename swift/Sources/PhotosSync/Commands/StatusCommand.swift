@@ -72,6 +72,19 @@ struct StatusCommand: AsyncParsableCommand {
         print("  Photos:            \(formatNumber(stats.photos))")
         print("  Videos:            \(formatNumber(stats.videos))")
         print("  Total size:        \(formatBytes(stats.totalBytes))")
+        
+        // Show problem assets if any
+        let problemStats = tracker.getProblemStats()
+        if problemStats.failed > 0 || problemStats.skipped > 0 {
+            print()
+            print("Problem Assets:")
+            if problemStats.failed > 0 {
+                print("  Failed:            \(formatNumber(problemStats.failed))")
+            }
+            if problemStats.skipped > 0 {
+                print("  Skipped:           \(formatNumber(problemStats.skipped))")
+            }
+        }
         print()
 
         // Live Photo stats
@@ -110,6 +123,9 @@ struct StatusCommand: AsyncParsableCommand {
         }
         if estimatedCloud > 0 {
             print("Run 'photos-sync import --include-cloud' to download and import from iCloud")
+        }
+        if problemStats.failed > 0 {
+            print("Run 'photos-sync review' to inspect \(formatNumber(problemStats.failed)) failed assets")
         }
     }
     
