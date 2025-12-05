@@ -13,6 +13,7 @@ public final class PhotosFetcher: Sendable {
         public let modificationDate: Date?
         public let isLocal: Bool  // Original is available locally
         public let isLivePhoto: Bool  // Contains paired video component
+        public let isCinematic: Bool  // Cinematic video with depth/focus data
     }
     
     public struct DownloadResult: Sendable {
@@ -40,9 +41,32 @@ public final class PhotosFetcher: Sendable {
         public let localIdentifier: String
         public let imageResult: DownloadResult
         public let videoResult: DownloadResult?  // nil if video export failed
-        
+
         public var success: Bool { imageResult.success }
         public var hasVideo: Bool { videoResult?.success ?? false }
+    }
+
+    /// Result of downloading a Cinematic video (main video + sidecars)
+    public struct CinematicDownloadResult: Sendable {
+        public let localIdentifier: String
+        public let videoResult: DownloadResult           // Main MOV with depth track
+        public let adjustmentDataResult: DownloadResult? // AAE sidecar
+        public let baseVideoResult: DownloadResult?      // Pre-edit state (if edited)
+        public let renderedVideoResult: DownloadResult?  // Baked effects (if edited)
+
+        public var success: Bool { videoResult.success }
+        public var hasAdjustmentData: Bool { adjustmentDataResult?.success ?? false }
+        public var hasBaseVideo: Bool { baseVideoResult?.success ?? false }
+        public var hasRenderedVideo: Bool { renderedVideoResult?.success ?? false }
+
+        /// All successfully exported sidecar URLs (excluding main video)
+        public var sidecarURLs: [URL] {
+            var urls: [URL] = []
+            if let url = adjustmentDataResult?.fileURL { urls.append(url) }
+            if let url = baseVideoResult?.fileURL { urls.append(url) }
+            if let url = renderedVideoResult?.fileURL { urls.append(url) }
+            return urls
+        }
     }
     
     /// Request Photos library access
@@ -96,7 +120,9 @@ public final class PhotosFetcher: Sendable {
             
             // Detect Live Photo via mediaSubtypes
             let isLivePhoto = asset.mediaSubtypes.contains(.photoLive)
-            
+            // Detect Cinematic video via mediaSubtypes
+            let isCinematic = asset.mediaSubtypes.contains(.videoCinematic)
+
             assets.append(AssetInfo(
                 localIdentifier: asset.localIdentifier,
                 filename: filename,
@@ -104,7 +130,8 @@ public final class PhotosFetcher: Sendable {
                 creationDate: asset.creationDate,
                 modificationDate: asset.modificationDate,
                 isLocal: false,  // Will check lazily during download
-                isLivePhoto: isLivePhoto
+                isLivePhoto: isLivePhoto,
+                isCinematic: isCinematic
             ))
         }
         
@@ -448,11 +475,218 @@ public final class PhotosFetcher: Sendable {
     public static func hasPairedVideoResource(identifier: String) -> Bool {
         let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
         guard let asset = fetchResult.firstObject else { return false }
-        
+
         let resources = PHAssetResource.assetResources(for: asset)
         return resources.contains { $0.type == .pairedVideo }
     }
-    
+
+    // MARK: - Cinematic Video Support
+
+    /// Download a Cinematic video with all its resources (main video + sidecars)
+    public static func downloadCinematicVideoAsset(
+        identifier: String,
+        to stagingDir: URL,
+        timeout: TimeInterval = 300,
+        allowNetwork: Bool = true
+    ) async -> CinematicDownloadResult {
+        // First, download the main video using the standard method
+        let videoResult = await downloadAsset(
+            identifier: identifier,
+            to: stagingDir,
+            timeout: timeout,
+            allowNetwork: allowNetwork
+        )
+
+        // If main video download failed, return early
+        guard videoResult.success else {
+            return CinematicDownloadResult(
+                localIdentifier: identifier,
+                videoResult: videoResult,
+                adjustmentDataResult: nil,
+                baseVideoResult: nil,
+                renderedVideoResult: nil
+            )
+        }
+
+        // Fetch the asset to get all resources
+        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+        guard let asset = fetchResult.firstObject else {
+            return CinematicDownloadResult(
+                localIdentifier: identifier,
+                videoResult: videoResult,
+                adjustmentDataResult: nil,
+                baseVideoResult: nil,
+                renderedVideoResult: nil
+            )
+        }
+
+        let resources = PHAssetResource.assetResources(for: asset)
+        let baseFilename = (videoResult.filename as NSString).deletingPathExtension
+
+        // Download adjustment data (AAE sidecar)
+        let adjustmentDataResult = await downloadResource(
+            resources: resources,
+            type: .adjustmentData,
+            identifier: identifier,
+            to: stagingDir,
+            filenameOverride: "\(baseFilename).AAE",
+            timeout: timeout,
+            allowNetwork: allowNetwork
+        )
+
+        // Download adjustment base video (if exists - only for edited videos)
+        let baseVideoResult = await downloadResource(
+            resources: resources,
+            type: .adjustmentBaseVideo,
+            identifier: identifier,
+            to: stagingDir,
+            filenameOverride: "\(baseFilename)_base.MOV",
+            timeout: timeout,
+            allowNetwork: allowNetwork
+        )
+
+        // Download full size rendered video (if exists - only for edited videos)
+        let renderedVideoResult = await downloadResource(
+            resources: resources,
+            type: .fullSizeVideo,
+            identifier: identifier,
+            to: stagingDir,
+            filenameOverride: "\(baseFilename)_rendered.MOV",
+            timeout: timeout,
+            allowNetwork: allowNetwork
+        )
+
+        return CinematicDownloadResult(
+            localIdentifier: identifier,
+            videoResult: videoResult,
+            adjustmentDataResult: adjustmentDataResult,
+            baseVideoResult: baseVideoResult,
+            renderedVideoResult: renderedVideoResult
+        )
+    }
+
+    /// Check if an asset is a Cinematic video
+    public static func isCinematicVideo(identifier: String) -> Bool {
+        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+        guard let asset = fetchResult.firstObject else { return false }
+        return asset.mediaSubtypes.contains(.videoCinematic)
+    }
+
+    /// Get info about Cinematic video resources
+    public static func getCinematicResourceInfo(identifier: String) -> (hasAdjustmentData: Bool, hasBaseVideo: Bool, hasRenderedVideo: Bool) {
+        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+        guard let asset = fetchResult.firstObject else {
+            return (false, false, false)
+        }
+
+        let resources = PHAssetResource.assetResources(for: asset)
+        let hasAdjustmentData = resources.contains { $0.type == .adjustmentData }
+        let hasBaseVideo = resources.contains { $0.type == .adjustmentBaseVideo }
+        let hasRenderedVideo = resources.contains { $0.type == .fullSizeVideo }
+
+        return (hasAdjustmentData, hasBaseVideo, hasRenderedVideo)
+    }
+
+    /// Download a specific resource type from an asset
+    private static func downloadResource(
+        resources: [PHAssetResource],
+        type: PHAssetResourceType,
+        identifier: String,
+        to stagingDir: URL,
+        filenameOverride: String? = nil,
+        timeout: TimeInterval = 300,
+        allowNetwork: Bool = true
+    ) async -> DownloadResult? {
+        guard let resource = resources.first(where: { $0.type == type }) else {
+            return nil  // Resource doesn't exist - not an error
+        }
+
+        let filename = filenameOverride ?? resource.originalFilename
+        let destURL = stagingDir.appendingPathComponent(filename)
+
+        // Remove existing file if present
+        try? FileManager.default.removeItem(at: destURL)
+
+        let finalFilename = filename
+        let mediaType = resourceTypeToMediaType(type)
+
+        return await withCheckedContinuation { continuation in
+            let options = PHAssetResourceRequestOptions()
+            options.isNetworkAccessAllowed = allowNetwork
+
+            // Use a class to safely track completion state across closures
+            final class CompletionState: @unchecked Sendable {
+                var completed = false
+                let lock = NSLock()
+
+                func tryComplete() -> Bool {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    if completed { return false }
+                    completed = true
+                    return true
+                }
+            }
+            let state = CompletionState()
+
+            // Set up timeout
+            let timeoutWork = DispatchWorkItem { [state] in
+                guard state.tryComplete() else { return }
+                continuation.resume(returning: DownloadResult(
+                    localIdentifier: identifier,
+                    filename: finalFilename,
+                    fileURL: nil,
+                    fileSize: 0,
+                    mediaType: mediaType,
+                    error: "Download timed out after \(Int(timeout))s"
+                ))
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: timeoutWork)
+
+            PHAssetResourceManager.default().writeData(
+                for: resource,
+                toFile: destURL,
+                options: options
+            ) { [state] error in
+                timeoutWork.cancel()
+
+                guard state.tryComplete() else { return }
+
+                if let error = error {
+                    continuation.resume(returning: DownloadResult(
+                        localIdentifier: identifier,
+                        filename: finalFilename,
+                        fileURL: nil,
+                        fileSize: 0,
+                        mediaType: mediaType,
+                        error: error.localizedDescription
+                    ))
+                } else {
+                    let fileSize = (try? FileManager.default.attributesOfItem(atPath: destURL.path)[.size] as? Int64) ?? 0
+                    continuation.resume(returning: DownloadResult(
+                        localIdentifier: identifier,
+                        filename: finalFilename,
+                        fileURL: destURL,
+                        fileSize: fileSize,
+                        mediaType: mediaType,
+                        error: nil
+                    ))
+                }
+            }
+        }
+    }
+
+    private static func resourceTypeToMediaType(_ type: PHAssetResourceType) -> String {
+        switch type {
+        case .video, .fullSizeVideo, .adjustmentBaseVideo:
+            return "video"
+        case .adjustmentData:
+            return "sidecar"
+        default:
+            return "unknown"
+        }
+    }
+
     private static func mediaTypeString(_ type: PHAssetMediaType) -> String {
         switch type {
         case .image: return "photo"

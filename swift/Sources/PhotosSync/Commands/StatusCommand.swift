@@ -73,6 +73,33 @@ struct StatusCommand: AsyncParsableCommand {
         print("  Videos:            \(formatNumber(stats.videos))")
         print("  Total size:        \(formatBytes(stats.totalBytes))")
         print()
+
+        // Live Photo stats
+        let livePhotoStats = tracker.getLivePhotoStats()
+        if livePhotoStats.total > 0 {
+            print("Live Photos:")
+            print("  Total:             \(formatNumber(livePhotoStats.total))")
+            print("  With motion video: \(formatNumber(livePhotoStats.withMotionVideo))")
+            if livePhotoStats.needingRepair > 0 {
+                print("  Needing repair:    \(formatNumber(livePhotoStats.needingRepair))")
+            }
+            print()
+        }
+
+        // Cinematic video stats
+        let cinematicStats = tracker.getCinematicStats()
+        if cinematicStats.total > 0 || countCinematic(assets) > 0 {
+            let libraryCount = countCinematic(assets)
+            print("Cinematic Videos:")
+            print("  In library:        \(formatNumber(libraryCount))")
+            print("  Imported:          \(formatNumber(cinematicStats.total))")
+            print("  With sidecars:     \(formatNumber(cinematicStats.withSidecars))")
+            if cinematicStats.needingRepair > 0 {
+                print("  Needing repair:    \(formatNumber(cinematicStats.needingRepair))")
+            }
+            print()
+        }
+
         print("Immich Server:")
         print("  URL:               \(config.immichURL)")
         print("  Status:            \(immichOnline ? "✓ Online" : "✗ Offline")")
@@ -96,5 +123,9 @@ struct StatusCommand: AsyncParsableCommand {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
         return formatter.string(fromByteCount: bytes)
+    }
+
+    private func countCinematic(_ assets: [PhotosFetcher.AssetInfo]) -> Int {
+        assets.filter { $0.isCinematic }.count
     }
 }

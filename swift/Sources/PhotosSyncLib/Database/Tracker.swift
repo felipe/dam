@@ -103,6 +103,33 @@ public final class Tracker: @unchecked Sendable {
             // Index creation failure is non-fatal
             sqlite3_free(errMsg)
         }
+
+        // Migration 2: Add Cinematic video columns
+        if !columns.contains("is_cinematic") {
+            let sql = "ALTER TABLE imported_assets ADD COLUMN is_cinematic INTEGER DEFAULT NULL"
+            if sqlite3_exec(db, sql, nil, nil, &errMsg) != SQLITE_OK {
+                let error = errMsg.map { String(cString: $0) } ?? "Unknown error"
+                sqlite3_free(errMsg)
+                throw TrackerError.execFailed("Migration failed (is_cinematic): \(error)")
+            }
+        }
+
+        // Store sidecar filenames as JSON array for Cinematic videos
+        if !columns.contains("cinematic_sidecars") {
+            let sql = "ALTER TABLE imported_assets ADD COLUMN cinematic_sidecars TEXT"
+            if sqlite3_exec(db, sql, nil, nil, &errMsg) != SQLITE_OK {
+                let error = errMsg.map { String(cString: $0) } ?? "Unknown error"
+                sqlite3_free(errMsg)
+                throw TrackerError.execFailed("Migration failed (cinematic_sidecars): \(error)")
+            }
+        }
+
+        // Create index for Cinematic queries
+        let cinematicIndexSql = "CREATE INDEX IF NOT EXISTS idx_is_cinematic ON imported_assets(is_cinematic)"
+        if sqlite3_exec(db, cinematicIndexSql, nil, nil, &errMsg) != SQLITE_OK {
+            // Index creation failure is non-fatal
+            sqlite3_free(errMsg)
+        }
     }
     
     private func getColumnNames(table: String) -> Set<String> {
@@ -167,21 +194,23 @@ public final class Tracker: @unchecked Sendable {
         fileSize: Int64,
         mediaType: String,
         isLivePhoto: Bool = false,
-        motionVideoImmichID: String? = nil
+        motionVideoImmichID: String? = nil,
+        isCinematic: Bool = false,
+        cinematicSidecars: [String]? = nil
     ) throws {
         try queue.sync {
             let sql = """
-                INSERT OR REPLACE INTO imported_assets 
-                (icloud_uuid, immich_id, filename, file_size, media_type, imported_at, is_live_photo, motion_video_immich_id)
-                VALUES (?, ?, ?, ?, ?, datetime('now'), ?, ?)
+                INSERT OR REPLACE INTO imported_assets
+                (icloud_uuid, immich_id, filename, file_size, media_type, imported_at, is_live_photo, motion_video_immich_id, is_cinematic, cinematic_sidecars)
+                VALUES (?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?)
             """
             var stmt: OpaquePointer?
-            
+
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 throw TrackerError.prepareFailed(String(cString: sqlite3_errmsg(db)))
             }
             defer { sqlite3_finalize(stmt) }
-            
+
             sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
             if let immichID = immichID {
                 sqlite3_bind_text(stmt, 2, immichID, -1, SQLITE_TRANSIENT)
@@ -197,7 +226,19 @@ public final class Tracker: @unchecked Sendable {
             } else {
                 sqlite3_bind_null(stmt, 7)
             }
-            
+            sqlite3_bind_int(stmt, 8, isCinematic ? 1 : 0)
+            if let sidecars = cinematicSidecars, !sidecars.isEmpty {
+                // Store as JSON array
+                if let jsonData = try? JSONSerialization.data(withJSONObject: sidecars),
+                   let jsonString = String(data: jsonData, encoding: .utf8) {
+                    sqlite3_bind_text(stmt, 9, jsonString, -1, SQLITE_TRANSIENT)
+                } else {
+                    sqlite3_bind_null(stmt, 9)
+                }
+            } else {
+                sqlite3_bind_null(stmt, 9)
+            }
+
             if sqlite3_step(stmt) != SQLITE_DONE {
                 throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
             }
@@ -505,27 +546,184 @@ public final class Tracker: @unchecked Sendable {
         var total = 0
         var withMotionVideo = 0
         var needingRepair = 0
-        
+
         // Total Live Photos
         if let count = querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE is_live_photo = 1") {
             total = count
         }
-        
+
         // With motion video backup
         if let count = querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE is_live_photo = 1 AND motion_video_immich_id IS NOT NULL") {
             withMotionVideo = count
         }
-        
+
         // Needing repair (known Live Photos without motion video + unknown status)
         if let count = querySingleInt("""
-            SELECT COUNT(*) FROM imported_assets 
+            SELECT COUNT(*) FROM imported_assets
             WHERE (is_live_photo = 1 AND motion_video_immich_id IS NULL)
                OR is_live_photo IS NULL
         """) {
             needingRepair = count
         }
-        
+
         return (total, withMotionVideo, needingRepair)
+    }
+
+    // MARK: - Cinematic Video Support
+
+    /// Check if an asset is a Cinematic video
+    public func isCinematic(uuid: String) -> Bool {
+        queue.sync {
+            let sql = "SELECT is_cinematic FROM imported_assets WHERE icloud_uuid = ? LIMIT 1"
+            var stmt: OpaquePointer?
+
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return false
+            }
+            defer { sqlite3_finalize(stmt) }
+
+            sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
+
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                return sqlite3_column_int(stmt, 0) == 1
+            }
+            return false
+        }
+    }
+
+    /// Get the sidecar filenames for a Cinematic video
+    public func getCinematicSidecars(uuid: String) -> [String] {
+        queue.sync {
+            let sql = "SELECT cinematic_sidecars FROM imported_assets WHERE icloud_uuid = ?"
+            var stmt: OpaquePointer?
+
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return []
+            }
+            defer { sqlite3_finalize(stmt) }
+
+            sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
+
+            if sqlite3_step(stmt) == SQLITE_ROW,
+               let cString = sqlite3_column_text(stmt, 0) {
+                let jsonString = String(cString: cString)
+                if let data = jsonString.data(using: .utf8),
+                   let sidecars = try? JSONSerialization.jsonObject(with: data) as? [String] {
+                    return sidecars
+                }
+            }
+            return []
+        }
+    }
+
+    /// Update Cinematic info for an existing asset
+    public func updateCinematicInfo(uuid: String, isCinematic: Bool, sidecars: [String]?) throws {
+        try queue.sync {
+            let sql = "UPDATE imported_assets SET is_cinematic = ?, cinematic_sidecars = ? WHERE icloud_uuid = ?"
+            var stmt: OpaquePointer?
+
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw TrackerError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+
+            sqlite3_bind_int(stmt, 1, isCinematic ? 1 : 0)
+            if let sidecars = sidecars, !sidecars.isEmpty {
+                if let jsonData = try? JSONSerialization.data(withJSONObject: sidecars),
+                   let jsonString = String(data: jsonData, encoding: .utf8) {
+                    sqlite3_bind_text(stmt, 2, jsonString, -1, SQLITE_TRANSIENT)
+                } else {
+                    sqlite3_bind_null(stmt, 2)
+                }
+            } else {
+                sqlite3_bind_null(stmt, 2)
+            }
+            sqlite3_bind_text(stmt, 3, uuid, -1, SQLITE_TRANSIENT)
+
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
+            }
+        }
+    }
+
+    /// Info about a Cinematic video needing repair (imported without sidecars)
+    public struct CinematicRepairInfo {
+        public let uuid: String
+        public let immichID: String?
+        public let filename: String
+    }
+
+    /// Get Cinematic videos that were imported without their sidecars
+    public func getCinematicsNeedingRepair() -> [CinematicRepairInfo] {
+        queue.sync {
+            var results: [CinematicRepairInfo] = []
+
+            // Find assets that are known Cinematic without sidecars
+            // OR assets with unknown Cinematic status (pre-migration imports)
+            let sql = """
+                SELECT icloud_uuid, immich_id, filename FROM imported_assets
+                WHERE (is_cinematic = 1 AND (cinematic_sidecars IS NULL OR cinematic_sidecars = '[]'))
+                   OR (is_cinematic IS NULL AND media_type = 'video')
+                ORDER BY imported_at ASC
+            """
+            var stmt: OpaquePointer?
+
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return results
+            }
+            defer { sqlite3_finalize(stmt) }
+
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let uuidCStr = sqlite3_column_text(stmt, 0) else { continue }
+                let uuid = String(cString: uuidCStr)
+
+                let immichID: String?
+                if let immichCStr = sqlite3_column_text(stmt, 1) {
+                    immichID = String(cString: immichCStr)
+                } else {
+                    immichID = nil
+                }
+
+                let filename: String
+                if let filenameCStr = sqlite3_column_text(stmt, 2) {
+                    filename = String(cString: filenameCStr)
+                } else {
+                    filename = ""
+                }
+
+                results.append(CinematicRepairInfo(uuid: uuid, immichID: immichID, filename: filename))
+            }
+
+            return results
+        }
+    }
+
+    /// Get count of Cinematic videos and those with sidecars backed up
+    public func getCinematicStats() -> (total: Int, withSidecars: Int, needingRepair: Int) {
+        var total = 0
+        var withSidecars = 0
+        var needingRepair = 0
+
+        // Total Cinematic videos
+        if let count = querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE is_cinematic = 1") {
+            total = count
+        }
+
+        // With sidecars backup
+        if let count = querySingleInt("SELECT COUNT(*) FROM imported_assets WHERE is_cinematic = 1 AND cinematic_sidecars IS NOT NULL AND cinematic_sidecars != '[]'") {
+            withSidecars = count
+        }
+
+        // Needing repair (known Cinematic without sidecars + unknown status videos)
+        if let count = querySingleInt("""
+            SELECT COUNT(*) FROM imported_assets
+            WHERE (is_cinematic = 1 AND (cinematic_sidecars IS NULL OR cinematic_sidecars = '[]'))
+               OR (is_cinematic IS NULL AND media_type = 'video')
+        """) {
+            needingRepair = count
+        }
+
+        return (total, withSidecars, needingRepair)
     }
 }
 

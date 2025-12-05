@@ -376,7 +376,7 @@ struct TrackerSpec {
         // Create tracker - migration runs on init
         let (tracker, dbPath) = try createTestTracker()
         defer { cleanup(dbPath) }
-        
+
         // Import using new columns should work
         try tracker.markImported(
             uuid: "test",
@@ -387,8 +387,281 @@ struct TrackerSpec {
             isLivePhoto: true,
             motionVideoImmichID: "motion-id"
         )
-        
+
         #expect(tracker.isLivePhoto(uuid: "test") == true)
         #expect(tracker.getMotionVideoImmichID(uuid: "test") == "motion-id")
+    }
+
+    // MARK: - Cinematic Video Tests
+
+    @Test("Marks Cinematic video with sidecars")
+    func markCinematicWithSidecars() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+
+        let uuid = "cinematic-1"
+        let sidecars = ["IMG_1234.AAE", "IMG_1234_base.MOV"]
+
+        try tracker.markImported(
+            uuid: uuid,
+            immichID: "video-immich-id",
+            filename: "IMG_1234.MOV",
+            fileSize: 50000,
+            mediaType: "video",
+            isLivePhoto: false,
+            motionVideoImmichID: nil,
+            isCinematic: true,
+            cinematicSidecars: sidecars
+        )
+
+        #expect(tracker.isCinematic(uuid: uuid) == true)
+        let retrievedSidecars = tracker.getCinematicSidecars(uuid: uuid)
+        #expect(retrievedSidecars.count == 2)
+        #expect(retrievedSidecars.contains("IMG_1234.AAE"))
+        #expect(retrievedSidecars.contains("IMG_1234_base.MOV"))
+    }
+
+    @Test("Marks Cinematic video without sidecars")
+    func markCinematicWithoutSidecars() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+
+        let uuid = "cinematic-no-sidecars"
+
+        try tracker.markImported(
+            uuid: uuid,
+            immichID: "video-id",
+            filename: "cinematic.mov",
+            fileSize: 40000,
+            mediaType: "video",
+            isLivePhoto: false,
+            motionVideoImmichID: nil,
+            isCinematic: true,
+            cinematicSidecars: nil
+        )
+
+        #expect(tracker.isCinematic(uuid: uuid) == true)
+        #expect(tracker.getCinematicSidecars(uuid: uuid).isEmpty)
+    }
+
+    @Test("Regular video is not Cinematic")
+    func regularVideoNotCinematic() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+
+        let uuid = "regular-video"
+
+        try tracker.markImported(
+            uuid: uuid,
+            immichID: "video-id",
+            filename: "regular.mov",
+            fileSize: 30000,
+            mediaType: "video",
+            isLivePhoto: false,
+            motionVideoImmichID: nil,
+            isCinematic: false,
+            cinematicSidecars: nil
+        )
+
+        #expect(tracker.isCinematic(uuid: uuid) == false)
+        #expect(tracker.getCinematicSidecars(uuid: uuid).isEmpty)
+    }
+
+    @Test("getCinematicsNeedingRepair finds Cinematic videos without sidecars")
+    func getCinematicsNeedingRepair() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+
+        // Cinematic with sidecars - should NOT need repair
+        try tracker.markImported(
+            uuid: "complete-cinematic",
+            immichID: "i1",
+            filename: "complete.mov",
+            fileSize: 50000,
+            mediaType: "video",
+            isLivePhoto: false,
+            motionVideoImmichID: nil,
+            isCinematic: true,
+            cinematicSidecars: ["complete.AAE"]
+        )
+
+        // Cinematic without sidecars - SHOULD need repair
+        try tracker.markImported(
+            uuid: "incomplete-cinematic",
+            immichID: "i2",
+            filename: "incomplete.mov",
+            fileSize: 45000,
+            mediaType: "video",
+            isLivePhoto: false,
+            motionVideoImmichID: nil,
+            isCinematic: true,
+            cinematicSidecars: nil
+        )
+
+        // Regular video - should NOT need repair
+        try tracker.markImported(
+            uuid: "regular",
+            immichID: "i3",
+            filename: "regular.mov",
+            fileSize: 30000,
+            mediaType: "video",
+            isLivePhoto: false,
+            motionVideoImmichID: nil,
+            isCinematic: false,
+            cinematicSidecars: nil
+        )
+
+        let needingRepair = tracker.getCinematicsNeedingRepair()
+
+        // Should include incomplete-cinematic and potentially regular (unknown status)
+        let incompleteFound = needingRepair.contains { $0.uuid == "incomplete-cinematic" }
+        #expect(incompleteFound)
+
+        // complete-cinematic should NOT be in the list
+        let completeFound = needingRepair.contains { $0.uuid == "complete-cinematic" }
+        #expect(!completeFound)
+    }
+
+    @Test("updateCinematicInfo updates existing asset")
+    func updateCinematicInfo() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+
+        let uuid = "update-cinematic"
+
+        // Initially import without Cinematic info
+        try tracker.markImported(
+            uuid: uuid,
+            immichID: "video-id",
+            filename: "video.mov",
+            fileSize: 40000,
+            mediaType: "video"
+        )
+
+        #expect(tracker.isCinematic(uuid: uuid) == false)
+        #expect(tracker.getCinematicSidecars(uuid: uuid).isEmpty)
+
+        // Update with Cinematic info
+        try tracker.updateCinematicInfo(
+            uuid: uuid,
+            isCinematic: true,
+            sidecars: ["video.AAE", "video_base.MOV"]
+        )
+
+        #expect(tracker.isCinematic(uuid: uuid) == true)
+        let sidecars = tracker.getCinematicSidecars(uuid: uuid)
+        #expect(sidecars.count == 2)
+        #expect(sidecars.contains("video.AAE"))
+    }
+
+    @Test("getCinematicStats returns correct counts")
+    func getCinematicStats() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+
+        // Complete Cinematic
+        try tracker.markImported(
+            uuid: "cinematic-1",
+            immichID: "i1",
+            filename: "a.mov",
+            fileSize: 50000,
+            mediaType: "video",
+            isLivePhoto: false,
+            motionVideoImmichID: nil,
+            isCinematic: true,
+            cinematicSidecars: ["a.AAE"]
+        )
+
+        // Complete Cinematic
+        try tracker.markImported(
+            uuid: "cinematic-2",
+            immichID: "i2",
+            filename: "b.mov",
+            fileSize: 55000,
+            mediaType: "video",
+            isLivePhoto: false,
+            motionVideoImmichID: nil,
+            isCinematic: true,
+            cinematicSidecars: ["b.AAE", "b_base.MOV"]
+        )
+
+        // Incomplete Cinematic (no sidecars)
+        try tracker.markImported(
+            uuid: "cinematic-3",
+            immichID: "i3",
+            filename: "c.mov",
+            fileSize: 45000,
+            mediaType: "video",
+            isLivePhoto: false,
+            motionVideoImmichID: nil,
+            isCinematic: true,
+            cinematicSidecars: nil
+        )
+
+        // Regular video
+        try tracker.markImported(
+            uuid: "regular",
+            immichID: "i4",
+            filename: "d.mov",
+            fileSize: 30000,
+            mediaType: "video",
+            isLivePhoto: false,
+            motionVideoImmichID: nil,
+            isCinematic: false,
+            cinematicSidecars: nil
+        )
+
+        let stats = tracker.getCinematicStats()
+
+        #expect(stats.total == 3)  // 3 Cinematic videos
+        #expect(stats.withSidecars == 2)  // 2 with sidecars
+        // needingRepair includes cinematic-3 (no sidecars) + regular (unknown status)
+        #expect(stats.needingRepair >= 1)
+    }
+
+    @Test("Migration adds Cinematic columns to existing database")
+    func migrationAddsCinematicColumns() throws {
+        // Create tracker - migration runs on init
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+
+        // Import using new columns should work
+        try tracker.markImported(
+            uuid: "test",
+            immichID: "i1",
+            filename: "test.mov",
+            fileSize: 50000,
+            mediaType: "video",
+            isLivePhoto: false,
+            motionVideoImmichID: nil,
+            isCinematic: true,
+            cinematicSidecars: ["test.AAE"]
+        )
+
+        #expect(tracker.isCinematic(uuid: "test") == true)
+        #expect(tracker.getCinematicSidecars(uuid: "test").contains("test.AAE"))
+    }
+
+    @Test("Handles empty sidecar array correctly")
+    func emptySidecarArray() throws {
+        let (tracker, dbPath) = try createTestTracker()
+        defer { cleanup(dbPath) }
+
+        let uuid = "empty-sidecars"
+
+        try tracker.markImported(
+            uuid: uuid,
+            immichID: "video-id",
+            filename: "video.mov",
+            fileSize: 40000,
+            mediaType: "video",
+            isLivePhoto: false,
+            motionVideoImmichID: nil,
+            isCinematic: true,
+            cinematicSidecars: []  // Empty array
+        )
+
+        #expect(tracker.isCinematic(uuid: uuid) == true)
+        #expect(tracker.getCinematicSidecars(uuid: uuid).isEmpty)
     }
 }
