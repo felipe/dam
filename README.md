@@ -109,6 +109,41 @@ Full sync: import new assets and cleanup deleted ones.
 photos-sync sync
 ```
 
+### `photos-sync review`
+
+Review and manage problem assets (failed/skipped imports).
+
+```bash
+# Show problem assets grouped by reason
+photos-sync review
+
+# Export to JSON for analysis
+photos-sync review --export problems.json
+
+# Retry failed imports
+photos-sync review --retry --include-cloud
+
+# Delete orphaned/corrupted assets from Photos
+photos-sync review --delete
+
+# Preview deletions
+photos-sync review --delete --dry-run
+
+# Filter to specific status
+photos-sync review --failed-only
+photos-sync review --skipped-only
+```
+
+**Flags:**
+- `--failed-only` - Show only failed assets
+- `--skipped-only` - Show only skipped assets
+- `--export FILE` - Export problem list to JSON
+- `--retry` - Retry importing failed assets
+- `--delete` - Delete problem assets from Photos (moves to Recently Deleted)
+- `--dry-run` - Preview without making changes
+- `--include-cloud` - Allow iCloud downloads during retry
+- `--limit N` - Maximum assets to process
+
 ## Asset Subtypes Tracked
 
 The tracker database stores subtype flags for each imported asset:
@@ -153,6 +188,32 @@ The `imported_assets` table tracks:
 - `has_paired_video` - Resource-based paired video detection
 - `motion_video_immich_id` - Linked motion video in Immich
 - `cinematic_sidecars` - JSON array of sidecar filenames
+- `status` - Import status: `imported`, `failed`, or `skipped`
+- `error_reason` - Reason for failure/skip
+- `asset_created_at` - Original asset creation date (helps locate in Photos)
+
+## Problem Asset Tracking
+
+Failed and skipped imports are tracked in the database with reasons. Use `photos-sync review` to inspect and manage them.
+
+Common issues:
+- **"No resource found"** - Orphaned metadata with no actual photo data (often `.dat` files from old iCloud sync issues). Safe to delete.
+- **"PHPhotosErrorDomain error 3169"** - iCloud download failed temporarily. Retry later with `--retry --include-cloud`.
+- **"Download failed"** - Network or Photos access issue. Retry later.
+
+```bash
+# Check for problems
+photos-sync status
+
+# Review and manage
+photos-sync review
+
+# Retry transient failures
+photos-sync review --retry --include-cloud
+
+# Delete unrecoverable orphans
+photos-sync review --delete
+```
 
 ## Repair Tools
 
