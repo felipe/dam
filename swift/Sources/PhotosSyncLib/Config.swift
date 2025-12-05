@@ -12,6 +12,11 @@ public struct Config: Sendable {
         dataDir.appendingPathComponent("tracker.db")
     }
     
+    /// Directory for storing Cinematic video sidecars
+    public var sidecarDir: URL {
+        dataDir.appendingPathComponent("sidecars")
+    }
+    
     public static func load(dryRun: Bool = false, batchSize: Int = 100) -> Config? {
         // Find .env file - look in dam directory
         let damDir = findDAMDirectory()

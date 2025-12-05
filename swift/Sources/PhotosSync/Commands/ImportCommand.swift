@@ -31,10 +31,17 @@ struct ImportCommand: AsyncParsableCommand {
           help: "Repair assets with paired video that were imported without motion video")
     var repairPairedVideos: Bool = false
     
+    @Flag(name: .long, help: "Repair Cinematic videos that were imported without sidecars")
+    var repairCinematic: Bool = false
+    
     func run() async throws {
-        // Handle repair mode separately
+        // Handle repair modes separately
         if repairPairedVideos {
             try await runRepairMode()
+            return
+        }
+        if repairCinematic {
+            try await runCinematicRepairMode()
             return
         }
         print("Requesting Photos access...")
@@ -206,6 +213,9 @@ struct ImportCommand: AsyncParsableCommand {
         print("Failed:     \(formatNumber(finalStats.failed))")
         if finalStats.pairedAssets > 0 {
             print("Paired assets: \(formatNumber(finalStats.pairedAssets)) (with \(formatNumber(finalStats.pairedVideos)) videos)")
+        }
+        if finalStats.cinematicVideos > 0 {
+            print("Cinematic:  \(formatNumber(finalStats.cinematicVideos)) (with \(formatNumber(finalStats.cinematicSidecars)) sidecars)")
         }
         if dryRun {
             print("Skipped:    \(formatNumber(finalStats.skipped)) (dry run)")
@@ -531,10 +541,17 @@ struct ImportCommand: AsyncParsableCommand {
         // Get dates upfront
         let dates = PhotosFetcher.getAssetDates(identifier: asset.localIdentifier)
         
-        // Skip Cinematic videos for now (need research - see issue #9)
+        // Handle Cinematic videos with multi-resource export
         if asset.isCinematic {
-            print("  Skipping Cinematic video (not yet supported, see issue #9)")
-            await stats.incrementSkipped()
+            await processCinematicVideo(
+                asset: asset,
+                dates: dates,
+                config: config,
+                immich: immich,
+                tracker: tracker,
+                stats: stats,
+                allowNetwork: allowNetwork
+            )
             return
         }
         
@@ -757,6 +774,291 @@ struct ImportCommand: AsyncParsableCommand {
         }
     }
     
+    /// Process a Cinematic video - uploads main video and preserves sidecars
+    private func processCinematicVideo(
+        asset: PhotosFetcher.AssetInfo,
+        dates: (created: Date?, modified: Date?),
+        config: Config,
+        immich: ImmichClient,
+        tracker: Tracker,
+        stats: ImportStatsActor,
+        allowNetwork: Bool
+    ) async {
+        print("  Exporting Cinematic video (video + sidecars)...")
+
+        // Download all resources (main video + sidecars)
+        let cinematicResult = await PhotosFetcher.downloadCinematicVideoAsset(
+            identifier: asset.localIdentifier,
+            to: config.stagingDir,
+            allowNetwork: allowNetwork
+        )
+
+        // Check if main video export succeeded
+        if !cinematicResult.success {
+            print("  ERROR: \(cinematicResult.videoResult.error ?? "Video export failed")")
+            await stats.incrementFailed()
+            return
+        }
+
+        guard let videoURL = cinematicResult.videoResult.fileURL else {
+            print("  ERROR: No video file URL")
+            await stats.incrementFailed()
+            return
+        }
+
+        await stats.incrementExported()
+        print("  Video exported: \(formatBytes(cinematicResult.videoResult.fileSize))")
+
+        // Report sidecar status
+        var sidecarFilenames: [String] = []
+        if cinematicResult.hasAdjustmentData, let aaeResult = cinematicResult.adjustmentDataResult {
+            print("  AAE sidecar: \(formatBytes(aaeResult.fileSize))")
+        }
+        if cinematicResult.hasBaseVideo, let baseResult = cinematicResult.baseVideoResult {
+            print("  Base video: \(formatBytes(baseResult.fileSize))")
+        }
+        if cinematicResult.hasRenderedVideo, let renderedResult = cinematicResult.renderedVideoResult {
+            print("  Rendered video: \(formatBytes(renderedResult.fileSize))")
+        }
+
+        // Move sidecars to permanent storage (sidecar directory)
+        // Create subdirectory for this asset's sidecars
+        let assetSidecarDir = config.sidecarDir.appendingPathComponent(
+            asset.localIdentifier.replacingOccurrences(of: "/", with: "_")
+        )
+        try? FileManager.default.createDirectory(at: assetSidecarDir, withIntermediateDirectories: true)
+
+        for sidecarURL in cinematicResult.sidecarURLs {
+            let destURL = assetSidecarDir.appendingPathComponent(sidecarURL.lastPathComponent)
+            try? FileManager.default.removeItem(at: destURL)
+            do {
+                try FileManager.default.moveItem(at: sidecarURL, to: destURL)
+                sidecarFilenames.append(destURL.lastPathComponent)
+                await stats.incrementCinematicSidecars()
+            } catch {
+                print("  WARNING: Could not move sidecar \(sidecarURL.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+
+        if !sidecarFilenames.isEmpty {
+            print("  Sidecars saved to: \(assetSidecarDir.path)")
+        }
+
+        // Upload main video to Immich
+        let uploadResult = await immich.uploadAsset(
+            fileURL: videoURL,
+            deviceAssetID: asset.localIdentifier,
+            fileCreatedAt: dates.created,
+            fileModifiedAt: dates.modified
+        )
+
+        // Clean up staging file
+        try? FileManager.default.removeItem(at: videoURL)
+
+        if uploadResult.success {
+            if uploadResult.duplicate {
+                print("  Video: duplicate in Immich")
+                await stats.incrementDuplicates()
+            } else {
+                print("  Video uploaded: \(uploadResult.assetID ?? "unknown")")
+                await stats.incrementUploaded()
+                await stats.incrementCinematicVideos()
+            }
+
+            // Track as imported Cinematic video with all subtypes
+            let subtypes = Tracker.AssetSubtypes(
+                isLivePhoto: asset.isLivePhoto,
+                isPortrait: asset.isPortrait,
+                isHDR: asset.isHDR,
+                isPanorama: asset.isPanorama,
+                isScreenshot: asset.isScreenshot,
+                isCinematic: true,
+                isSlomo: asset.isSlomo,
+                isTimelapse: asset.isTimelapse,
+                isSpatialVideo: asset.isSpatialVideo,
+                isProRAW: asset.isProRAW,
+                hasPairedVideo: asset.hasPairedVideo
+            )
+            try? tracker.markImported(
+                uuid: asset.localIdentifier,
+                immichID: uploadResult.assetID,
+                filename: cinematicResult.videoResult.filename,
+                fileSize: cinematicResult.videoResult.fileSize,
+                mediaType: cinematicResult.videoResult.mediaType,
+                subtypes: subtypes,
+                motionVideoImmichID: nil,
+                cinematicSidecars: sidecarFilenames.isEmpty ? nil : sidecarFilenames
+            )
+        } else {
+            print("  ERROR: Video upload failed: \(uploadResult.error ?? "unknown")")
+            await stats.incrementFailed()
+        }
+    }
+
+    /// Repair mode: Find Cinematic videos imported without sidecars and re-export sidecars
+    private func runCinematicRepairMode() async throws {
+        print("Requesting Photos access...")
+        guard await PhotosFetcher.requestAccess() else {
+            print("ERROR: Photos access denied. Grant access in System Settings → Privacy → Photos")
+            throw ExitCode.failure
+        }
+
+        guard let config = Config.load(dryRun: dryRun) else {
+            throw ExitCode.failure
+        }
+
+        if dryRun {
+            print("DRY RUN MODE - No changes will be made")
+            print()
+        }
+
+        // Load tracker
+        let tracker = try Tracker(dbPath: config.trackerDBPath)
+
+        // Get stats on Cinematic videos
+        let cinematicStats = tracker.getCinematicStats()
+        print()
+        print("Cinematic Video Status:")
+        print("  Total tracked:    \(formatNumber(cinematicStats.total))")
+        print("  With sidecars:    \(formatNumber(cinematicStats.withSidecars))")
+        print("  Needing repair:   \(formatNumber(cinematicStats.needingRepair))")
+        print()
+
+        // Get Cinematic videos needing repair
+        let needingRepair = tracker.getCinematicsNeedingRepair()
+
+        if needingRepair.isEmpty {
+            print("No Cinematic videos need repair.")
+            return
+        }
+
+        // Get all Photos library assets to cross-reference
+        print("Loading Photos library to find Cinematic videos...")
+        let allAssets = PhotosFetcher.getAllAssets()
+        let assetMap = Dictionary(uniqueKeysWithValues: allAssets.map { ($0.localIdentifier, $0) })
+
+        // Filter to only those that are actually Cinematic in the library
+        var toRepair: [(info: Tracker.CinematicRepairInfo, asset: PhotosFetcher.AssetInfo)] = []
+        for info in needingRepair {
+            guard let asset = assetMap[info.uuid] else {
+                // Asset no longer in library, skip
+                continue
+            }
+
+            if asset.isCinematic {
+                toRepair.append((info, asset))
+            } else {
+                // Not actually Cinematic - update tracker
+                if !dryRun {
+                    try? tracker.updateCinematicInfo(uuid: info.uuid, isCinematic: false, sidecars: nil)
+                }
+            }
+        }
+
+        // Apply limit
+        if limit > 0 && toRepair.count > limit {
+            toRepair = Array(toRepair.prefix(limit))
+        }
+
+        print("Cinematic videos to repair: \(formatNumber(toRepair.count))")
+
+        if toRepair.isEmpty {
+            print("No Cinematic videos need repair after verification.")
+            return
+        }
+
+        print()
+        print(String(repeating: "=", count: 50))
+        print("REPAIRING \(formatNumber(toRepair.count)) CINEMATIC VIDEOS")
+        print(String(repeating: "=", count: 50))
+        print()
+
+        var repaired = 0
+        var failed = 0
+        var skipped = 0
+
+        for (index, item) in toRepair.enumerated() {
+            let num = index + 1
+            print("[\(num)/\(toRepair.count)] \(item.info.filename)")
+
+            if dryRun {
+                print("  DRY RUN: Would repair Cinematic video sidecars")
+                skipped += 1
+                continue
+            }
+
+            // Download all resources (we only need the sidecars)
+            print("  Exporting sidecars...")
+            let cinematicResult = await PhotosFetcher.downloadCinematicVideoAsset(
+                identifier: item.info.uuid,
+                to: config.stagingDir,
+                allowNetwork: includeCloud
+            )
+
+            // Clean up main video file - we don't need it for repair
+            if let videoURL = cinematicResult.videoResult.fileURL {
+                try? FileManager.default.removeItem(at: videoURL)
+            }
+
+            // Check if we got any sidecars
+            if cinematicResult.sidecarURLs.isEmpty {
+                print("  WARNING: No sidecars found for this Cinematic video")
+                // Update tracker to mark as Cinematic with no sidecars
+                try? tracker.updateCinematicInfo(uuid: item.info.uuid, isCinematic: true, sidecars: nil)
+                skipped += 1
+                continue
+            }
+
+            // Move sidecars to permanent storage
+            let assetSidecarDir = config.sidecarDir.appendingPathComponent(
+                item.info.uuid.replacingOccurrences(of: "/", with: "_")
+            )
+            try? FileManager.default.createDirectory(at: assetSidecarDir, withIntermediateDirectories: true)
+
+            var sidecarFilenames: [String] = []
+            for sidecarURL in cinematicResult.sidecarURLs {
+                let destURL = assetSidecarDir.appendingPathComponent(sidecarURL.lastPathComponent)
+                try? FileManager.default.removeItem(at: destURL)
+                do {
+                    try FileManager.default.moveItem(at: sidecarURL, to: destURL)
+                    sidecarFilenames.append(destURL.lastPathComponent)
+                    print("  Saved: \(destURL.lastPathComponent)")
+                } catch {
+                    print("  WARNING: Could not move sidecar: \(error.localizedDescription)")
+                }
+            }
+
+            if !sidecarFilenames.isEmpty {
+                // Update tracker with sidecar info
+                try? tracker.updateCinematicInfo(
+                    uuid: item.info.uuid,
+                    isCinematic: true,
+                    sidecars: sidecarFilenames
+                )
+                print("  Sidecars saved to: \(assetSidecarDir.path)")
+                repaired += 1
+            } else {
+                failed += 1
+            }
+
+            // Delay between repairs
+            if index < toRepair.count - 1 && delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
+
+        // Summary
+        print()
+        print(String(repeating: "=", count: 50))
+        print("REPAIR COMPLETE")
+        print(String(repeating: "=", count: 50))
+        print("Repaired: \(formatNumber(repaired))")
+        print("Failed:   \(formatNumber(failed))")
+        if dryRun {
+            print("Skipped:  \(formatNumber(skipped)) (dry run)")
+        }
+    }
+
     private func formatNumber(_ n: Int) -> String {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal
@@ -779,6 +1081,8 @@ actor ImportStatsActor {
     private var skipped = 0
     private var pairedAssets = 0
     private var pairedVideos = 0
+    private var cinematicVideos = 0
+    private var cinematicSidecars = 0
     
     func incrementExported() { exported += 1 }
     func incrementUploaded() { uploaded += 1 }
@@ -787,8 +1091,10 @@ actor ImportStatsActor {
     func incrementSkipped() { skipped += 1 }
     func incrementPairedAssets() { pairedAssets += 1 }
     func incrementPairedVideos() { pairedVideos += 1 }
+    func incrementCinematicVideos() { cinematicVideos += 1 }
+    func incrementCinematicSidecars() { cinematicSidecars += 1 }
     
-    func getStats() -> (exported: Int, uploaded: Int, duplicates: Int, failed: Int, skipped: Int, pairedAssets: Int, pairedVideos: Int) {
-        (exported, uploaded, duplicates, failed, skipped, pairedAssets, pairedVideos)
+    func getStats() -> (exported: Int, uploaded: Int, duplicates: Int, failed: Int, skipped: Int, pairedAssets: Int, pairedVideos: Int, cinematicVideos: Int, cinematicSidecars: Int) {
+        (exported, uploaded, duplicates, failed, skipped, pairedAssets, pairedVideos, cinematicVideos, cinematicSidecars)
     }
 }
