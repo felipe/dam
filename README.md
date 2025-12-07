@@ -38,10 +38,11 @@ In Immich, go to **Administration → Settings → Storage Template** and set:
 {{y}}/{{MM}}/{{dd}}_{{HH}}{{mm}}{{ss}}-{{filetype}}-{{assetIdShort}}
 ```
 
-This organizes files by year/month with a filename that includes:
-- Date and time (`2025/12/05_143022`)
-- File type (`-photo-` or `-video-`)
-- Short unique ID (`-abc123`)
+This template is recommended because:
+- **Human readable**: Files are organized by year/month with clear date-based names
+- **Source agnostic**: Works well when importing from multiple sources (Photos.app, camera imports, etc.)
+- **Sortable**: Files sort chronologically by filename
+- **Unique**: Short asset ID prevents collisions for photos taken at the same second
 
 Example: `2025/12/05_143022-photo-a1b2c3.heic`
 
