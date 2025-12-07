@@ -28,6 +28,23 @@ A tool for migrating photos and videos from Apple Photos/iCloud to [Immich](http
 
 3. Grant Photos access when prompted (System Settings → Privacy → Photos)
 
+## Recommended Immich Settings
+
+### Storage Template
+
+In Immich, go to **Administration → Settings → Storage Template** and set:
+
+```
+{{y}}/{{MM}}/{{dd}}_{{HH}}{{mm}}{{ss}}-{{filetype}}-{{assetIdShort}}
+```
+
+This organizes files by year/month with a filename that includes:
+- Date and time (`2025/12/05_143022`)
+- File type (`-photo-` or `-video-`)
+- Short unique ID (`-abc123`)
+
+Example: `2025/12/05_143022-photo-a1b2c3.heic`
+
 ## Commands
 
 ### `photos-sync status`
