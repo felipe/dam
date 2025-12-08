@@ -1,6 +1,6 @@
 # DAM - Digital Asset Migration
 
-A tool for migrating photos and videos from Apple Photos/iCloud to [Immich](https://immich.app/).
+A tool for migrating photos and videos from Apple Photos/iCloud to [Immich](https://immich.app/), with encrypted cloud backup capabilities.
 
 ## Features
 
@@ -11,6 +11,7 @@ A tool for migrating photos and videos from Apple Photos/iCloud to [Immich](http
 - **Incremental Sync**: Tracks imported assets to avoid duplicates
 - **iCloud Support**: Can attempt to download assets stored in iCloud when requested
 - **Repair Tools**: Verify and fix assets that may not have synced correctly
+- **Encrypted Cloud Backup**: Backup Immich data to Backblaze B2 with client-side encryption
 
 ## Setup
 
@@ -26,13 +27,13 @@ A tool for migrating photos and videos from Apple Photos/iCloud to [Immich](http
    swift build -c release
    ```
 
-3. Grant Photos access when prompted (System Settings → Privacy → Photos)
+3. Grant Photos access when prompted (System Settings -> Privacy -> Photos)
 
 ## Recommended Immich Settings
 
 ### Storage Template
 
-In Immich, go to **Administration → Settings → Storage Template** and set:
+In Immich, go to **Administration -> Settings -> Storage Template** and set:
 
 ```
 {{y}}/{{MM}}/{{dd}}_{{HH}}{{mm}}{{ss}}-{{filetype}}-{{assetIdShort}}
@@ -162,6 +163,224 @@ photos-sync review --skipped-only
 - `--include-cloud` - Allow iCloud downloads during retry
 - `--limit N` - Maximum assets to process
 
+### `photos-sync backup`
+
+Backup Immich data to encrypted cloud storage (Backblaze B2).
+
+```bash
+# Check prerequisites
+photos-sync backup --check
+
+# Run setup wizard
+photos-sync backup --setup
+
+# Run backup
+photos-sync backup
+
+# Backup to a specific destination
+photos-sync backup --to b2
+
+# Show backup status
+photos-sync backup --status
+
+# Preview what would be synced (dry run)
+photos-sync backup --dry-run
+
+# Force backup ignoring stale jobs
+photos-sync backup --force
+
+# Reset all job state for fresh start
+photos-sync backup --reset
+```
+
+**Flags:**
+- `--check` - Validate prerequisites (rclone, 1Password CLI)
+- `--setup` - Run interactive setup wizard
+- `--to <name>` - Backup to specific destination (default: b2)
+- `--status` - Show backup status from database
+- `--force` - Ignore stale job detection and proceed
+- `--dry-run` - Preview what would be synced without transferring
+- `--reset` - Clear all job state for destination
+
+## Backup Feature
+
+The backup command enables encrypted offsite backup of your Immich data to Backblaze B2 cloud storage.
+
+### Prerequisites
+
+Before using backup, install these tools:
+
+```bash
+# Install rclone (handles file sync)
+brew install rclone
+
+# Install 1Password CLI (manages credentials securely)
+brew install 1password-cli
+
+# Sign in to 1Password CLI
+op signin
+```
+
+### Configuration
+
+Add these variables to your `.env` file:
+
+```bash
+# Path to Immich data directory (required)
+BACKUP_IMMICH_PATH=/path/to/immich/data
+
+# Stats interval in seconds (default: 60)
+# Used for stale job detection
+BACKUP_STATS_INTERVAL=60
+
+# Maximum retry attempts for failed jobs (default: 3)
+BACKUP_MAX_RETRIES=3
+```
+
+### Setup Process
+
+1. **Check prerequisites**:
+   ```bash
+   photos-sync backup --check
+   ```
+   This verifies rclone and 1Password CLI are installed and signed in.
+
+2. **Run the setup wizard**:
+   ```bash
+   photos-sync backup --setup
+   ```
+   The wizard will:
+   - Check prerequisites
+   - Create or locate a 1Password item for credentials
+   - Guide you to add your B2 application key
+   - Configure rclone remotes (B2 + encryption)
+   - Test encryption with a test write
+   - Save the destination configuration
+
+3. **Add your B2 credentials**:
+   - Go to Backblaze B2 and create an Application Key
+   - Open 1Password and find "Immich Backup B2"
+   - Fill in: `application_key_id`, `application_key`, `bucket_name`
+   - The `encryption_password` is auto-generated
+
+### Running Backups
+
+```bash
+# Run a backup
+photos-sync backup
+
+# Preview without transferring files
+photos-sync backup --dry-run
+
+# Check status
+photos-sync backup --status
+```
+
+### Backup Status
+
+The `--status` flag shows detailed backup information:
+- Last backup time per destination
+- Job counts (completed, running, pending, failed)
+- Total bytes and files transferred
+- Current progress if a backup is running
+- Warnings about stale or failed jobs
+
+### Architecture
+
+#### Client-Side Encryption
+All data is encrypted **before** leaving your computer using rclone's crypt backend:
+- Files are encrypted with your unique encryption password
+- Filenames are also encrypted
+- Even Backblaze cannot read your data
+- Encryption password is stored securely in 1Password
+
+#### Job Tracking and Resumability
+Backups can span multiple terabytes and may be interrupted:
+- Each source directory is a separate job with priority
+- Progress is tracked in the database (bytes, files, speed)
+- Interrupted backups resume where they left off
+- Stale detection prevents orphaned running jobs
+
+#### 1Password Credential Storage
+Credentials never touch disk or config files:
+- B2 keys stored in 1Password vault
+- Encryption password generated and stored in 1Password
+- Retrieved at runtime via `op` CLI
+- No secrets in `.env` or rclone.conf
+
+#### Directories Backed Up
+The following Immich directories are backed up (in priority order):
+1. `library/` - Main photo/video library (priority 1)
+2. `upload/` - Uploaded files pending processing (priority 2)
+3. `profile/` - User profile images (priority 3)
+4. `backups/` - Immich database backups (priority 4)
+5. `dam/data/` - Local DAM tracking database (priority 5)
+
+Directories like `thumbs/` and `encoded-video/` are skipped as they can be regenerated.
+
+### Troubleshooting
+
+#### Stale Job Recovery
+
+If a backup was interrupted (network drop, sleep, etc.), you may see stale job warnings:
+
+```
+WARNING: Found 1 stale job(s):
+  - library: Last update 2 hours ago
+```
+
+Options:
+- `--force` - Mark stale jobs as interrupted and resume
+- `--reset` - Clear all job state and start fresh
+
+```bash
+# Resume interrupted backup
+photos-sync backup --force
+
+# Start completely fresh
+photos-sync backup --reset
+```
+
+#### 1Password Sign-in Issues
+
+If you see "1Password CLI is not signed in":
+
+```bash
+# Sign in to 1Password
+op signin
+
+# Verify sign-in worked
+op account get
+```
+
+Make sure:
+- You have 1Password desktop app installed
+- The CLI is linked to your account
+- Touch ID or password authentication is available
+
+#### rclone Configuration Debugging
+
+If rclone isn't working properly:
+
+```bash
+# List configured remotes
+rclone listremotes
+
+# Test B2 connection
+rclone lsd b2-b2:
+
+# Test crypt remote
+rclone lsd b2-crypt:
+
+# Check rclone config
+rclone config show
+```
+
+Common issues:
+- Expired B2 application key - create a new one in B2 dashboard
+- Wrong bucket name - verify in 1Password item
+- Missing encryption password - check 1Password item has all 4 fields
+
 ## Asset Subtypes Tracked
 
 The tracker database stores subtype flags for each imported asset:
@@ -186,6 +405,7 @@ The tracker database stores subtype flags for each imported asset:
 dam/
 ├── data/
 │   ├── tracker.db          # SQLite database tracking all imports
+│   ├── backup.log          # Latest backup execution log
 │   └── sidecars/           # Cinematic video sidecars
 │       └── {asset_id}/     # Per-asset sidecar directory
 │           ├── VIDEO.AAE   # Adjustment data
@@ -209,6 +429,28 @@ The `imported_assets` table tracks:
 - `status` - Import status: `imported`, `failed`, or `skipped`
 - `error_reason` - Reason for failure/skip
 - `asset_created_at` - Original asset creation date (helps locate in Photos)
+
+The `backup_destinations` table tracks:
+- `id` - Unique destination ID
+- `name` - Destination name (e.g., "b2")
+- `type` - Destination type (e.g., "b2")
+- `bucket_name` - Cloud bucket name
+- `remote_path` - Path within the bucket
+- `created_at` - When configured
+- `last_backup_at` - Last successful backup timestamp
+
+The `backup_jobs` table tracks:
+- `id` - Unique job ID
+- `destination_id` - Foreign key to destination
+- `source_path` - Local directory being backed up
+- `status` - PENDING, RUNNING, COMPLETED, INTERRUPTED, FAILED
+- `bytes_total`, `bytes_transferred` - Transfer progress
+- `files_total`, `files_transferred` - File counts
+- `transfer_speed` - Current speed in bytes/sec
+- `started_at`, `completed_at`, `last_update` - Timestamps
+- `error_message` - Error details for failed jobs
+- `retry_count` - Number of retry attempts
+- `priority` - Execution order
 
 ## Problem Asset Tracking
 
