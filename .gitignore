@@ -33,3 +33,16 @@ logs/
 # Swift build artifacts
 swift/.build/
 swift/.swiftpm/
+
+# Python
+.venv/
+
+# Claude Code
+.claude/
+
+# Agent OS (uncommitted for now)
+agent-os/
+
+# Temporary files
+firstsync.txt
+swift/resync-uuids.swift
