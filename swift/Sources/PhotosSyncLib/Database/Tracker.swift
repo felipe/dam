@@ -189,6 +189,9 @@ public final class Tracker: @unchecked Sendable {
 
         // Migration 4: Add backup tables
         try runBackupMigrations()
+
+        // Migration 5: Add favorites sync columns
+        try runFavoritesMigrations()
     }
 
     private func runBackupMigrations() throws {
@@ -244,6 +247,42 @@ public final class Tracker: @unchecked Sendable {
             let error = errMsg.map { String(cString: $0) } ?? "Unknown error"
             sqlite3_free(errMsg)
             print("Migration warning (backup_jobs): \(error)")
+        }
+    }
+
+    /// Migration 5: Add favorites sync columns for bidirectional favorites sync
+    private func runFavoritesMigrations() throws {
+        var errMsg: UnsafeMutablePointer<CChar>?
+        let columns = getColumnNames(table: "imported_assets")
+
+        // Add is_favorite column (INTEGER to store Bool: 0=false, 1=true, NULL=unknown)
+        if !columns.contains("is_favorite") {
+            let sql = "ALTER TABLE imported_assets ADD COLUMN is_favorite INTEGER DEFAULT NULL"
+            if sqlite3_exec(db, sql, nil, nil, &errMsg) != SQLITE_OK {
+                let error = errMsg.map { String(cString: $0) } ?? "Unknown error"
+                sqlite3_free(errMsg)
+                errMsg = nil
+                print("Migration warning (is_favorite): \(error)")
+            }
+        }
+
+        // Add favorite_modified_at column to track when favorite status last changed
+        if !columns.contains("favorite_modified_at") {
+            let sql = "ALTER TABLE imported_assets ADD COLUMN favorite_modified_at TIMESTAMP DEFAULT NULL"
+            if sqlite3_exec(db, sql, nil, nil, &errMsg) != SQLITE_OK {
+                let error = errMsg.map { String(cString: $0) } ?? "Unknown error"
+                sqlite3_free(errMsg)
+                errMsg = nil
+                print("Migration warning (favorite_modified_at): \(error)")
+            }
+        }
+
+        // Create index on is_favorite for efficient favorite queries
+        let indexSql = "CREATE INDEX IF NOT EXISTS idx_is_favorite ON imported_assets(is_favorite)"
+        if sqlite3_exec(db, indexSql, nil, nil, &errMsg) != SQLITE_OK {
+            // Index creation failure is non-fatal
+            sqlite3_free(errMsg)
+            errMsg = nil
         }
     }
 
@@ -1275,6 +1314,131 @@ public final class Tracker: @unchecked Sendable {
             if sqlite3_step(stmt) != SQLITE_DONE {
                 throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
             }
+        }
+    }
+
+    // MARK: - Favorites Sync Support
+
+    /// Update the favorite status for an asset
+    /// - Parameters:
+    ///   - uuid: The iCloud UUID of the asset
+    ///   - isFavorite: The new favorite status (true/false)
+    public func updateFavoriteStatus(uuid: String, isFavorite: Bool) throws {
+        try queue.sync {
+            let sql = "UPDATE imported_assets SET is_favorite = ?, favorite_modified_at = datetime('now') WHERE icloud_uuid = ?"
+            var stmt: OpaquePointer?
+
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw TrackerError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+
+            sqlite3_bind_int(stmt, 1, isFavorite ? 1 : 0)
+            sqlite3_bind_text(stmt, 2, uuid, -1, SQLITE_TRANSIENT)
+
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                throw TrackerError.execFailed(String(cString: sqlite3_errmsg(db)))
+            }
+        }
+    }
+
+    /// Get the favorite status for an asset
+    /// - Parameter uuid: The iCloud UUID of the asset
+    /// - Returns: A tuple with (isFavorite: Bool?, modifiedAt: Date?) - nil values indicate no tracked status
+    public func getFavoriteStatus(uuid: String) -> (isFavorite: Bool?, modifiedAt: Date?) {
+        queue.sync {
+            let sql = "SELECT is_favorite, favorite_modified_at FROM imported_assets WHERE icloud_uuid = ?"
+            var stmt: OpaquePointer?
+
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return (nil, nil)
+            }
+            defer { sqlite3_finalize(stmt) }
+
+            sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT)
+
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                // Check if is_favorite is NULL
+                var isFavorite: Bool? = nil
+                if sqlite3_column_type(stmt, 0) != SQLITE_NULL {
+                    isFavorite = sqlite3_column_int(stmt, 0) == 1
+                }
+
+                // Check if favorite_modified_at is NULL
+                var modifiedAt: Date? = nil
+                if sqlite3_column_type(stmt, 1) != SQLITE_NULL,
+                   let cStr = sqlite3_column_text(stmt, 1) {
+                    let sqlFormatter = DateFormatter()
+                    sqlFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+                    sqlFormatter.timeZone = TimeZone(identifier: "UTC")
+                    modifiedAt = sqlFormatter.date(from: String(cString: cStr))
+                }
+
+                return (isFavorite, modifiedAt)
+            }
+            return (nil, nil)
+        }
+    }
+
+    /// Info about an asset with tracked favorite status
+    public struct TrackedFavoriteInfo: Sendable {
+        public let uuid: String
+        public let immichId: String?
+        public let isFavorite: Bool
+        public let modifiedAt: Date?
+    }
+
+    /// Get all assets that have tracked favorite status (is_favorite IS NOT NULL)
+    /// - Returns: List of assets with their UUID, Immich ID, favorite status, and modification timestamp
+    public func getAssetsWithTrackedFavorites() -> [TrackedFavoriteInfo] {
+        queue.sync {
+            var results: [TrackedFavoriteInfo] = []
+
+            let sql = """
+                SELECT icloud_uuid, immich_id, is_favorite, favorite_modified_at
+                FROM imported_assets
+                WHERE is_favorite IS NOT NULL
+                ORDER BY favorite_modified_at DESC
+            """
+            var stmt: OpaquePointer?
+
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return results
+            }
+            defer { sqlite3_finalize(stmt) }
+
+            let sqlFormatter = DateFormatter()
+            sqlFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            sqlFormatter.timeZone = TimeZone(identifier: "UTC")
+
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let uuidCStr = sqlite3_column_text(stmt, 0) else { continue }
+                let uuid = String(cString: uuidCStr)
+
+                let immichId: String?
+                if let immichCStr = sqlite3_column_text(stmt, 1) {
+                    immichId = String(cString: immichCStr)
+                } else {
+                    immichId = nil
+                }
+
+                let isFavorite = sqlite3_column_int(stmt, 2) == 1
+
+                var modifiedAt: Date? = nil
+                if sqlite3_column_type(stmt, 3) != SQLITE_NULL,
+                   let cStr = sqlite3_column_text(stmt, 3) {
+                    modifiedAt = sqlFormatter.date(from: String(cString: cStr))
+                }
+
+                results.append(TrackedFavoriteInfo(
+                    uuid: uuid,
+                    immichId: immichId,
+                    isFavorite: isFavorite,
+                    modifiedAt: modifiedAt
+                ))
+            }
+
+            return results
         }
     }
 

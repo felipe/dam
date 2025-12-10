@@ -3,37 +3,70 @@ import ArgumentParser
 import Foundation
 import Photos
 
+/// Metadata sync mode for the import command
+enum MetadataSyncMode: String, CaseIterable {
+    case none = "none"
+    case favorites = "favorites"
+    case all = "all"
+}
+
 struct ImportCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "import",
         abstract: "Import photos from Photos.app to Immich"
     )
-    
+
     @Flag(name: .long, help: "Preview what would be imported without making changes")
     var dryRun: Bool = false
-    
+
     @Flag(name: .long, help: "Include photos that need to be downloaded from iCloud")
     var includeCloud: Bool = false
-    
+
     @Flag(name: .long, help: "Skip slow local availability check, fail fast on cloud-only assets")
     var skipLocalCheck: Bool = false
-    
+
     @Option(name: .long, help: "Maximum number of photos to process (0 = unlimited)")
     var limit: Int = 0
-    
+
     @Option(name: .long, help: "Number of concurrent imports")
     var concurrency: Int = 1
-    
+
     @Option(name: .long, help: "Delay between iCloud downloads in seconds")
     var delay: Double = 5.0
-    
-    @Flag(name: [.customLong("repair-paired-videos"), .customLong("repair-live-photos")], 
+
+    @Flag(name: [.customLong("repair-paired-videos"), .customLong("repair-live-photos")],
           help: "Repair assets with paired video that were imported without motion video")
     var repairPairedVideos: Bool = false
-    
+
     @Flag(name: .long, help: "Repair Cinematic videos that were imported without sidecars")
     var repairCinematic: Bool = false
-    
+
+    // Metadata sync flags - mutually exclusive, last one wins
+    @Flag(name: .long, help: "Sync only favorites metadata between Photos and Immich")
+    var favorites: Bool = false
+
+    @Flag(name: [.customLong("sync-all"), .customLong("all-metadata")],
+          help: "Sync all metadata between Photos and Immich (currently: favorites)")
+    var syncAll: Bool = false
+
+    @Flag(name: [.customLong("sync-none"), .customLong("no-metadata")],
+          help: "Do not sync any metadata (default)")
+    var syncNone: Bool = false
+
+    /// Determine the effective metadata sync mode based on flags
+    /// Last specified flag wins; default is none
+    private var metadataSyncMode: MetadataSyncMode {
+        // Since ArgumentParser processes flags in order, we check in reverse priority
+        // The logic here: if syncNone is true, it was specified, so use none
+        // Otherwise, if syncAll is true, use all
+        // Otherwise, if favorites is true, use favorites
+        // Default is none
+        if syncNone { return .none }
+        if syncAll { return .all }
+        if favorites { return .favorites }
+        return .none
+    }
+
     func run() async throws {
         // Handle repair modes separately
         if repairPairedVideos {
@@ -46,19 +79,25 @@ struct ImportCommand: AsyncParsableCommand {
         }
         print("Requesting Photos access...")
         guard await PhotosFetcher.requestAccess() else {
-            print("ERROR: Photos access denied. Grant access in System Settings → Privacy → Photos")
+            print("ERROR: Photos access denied. Grant access in System Settings -> Privacy -> Photos")
             throw ExitCode.failure
         }
-        
+
         guard let config = Config.load(dryRun: dryRun) else {
             throw ExitCode.failure
         }
-        
+
         if dryRun {
             print("DRY RUN MODE - No changes will be made")
             print()
         }
-        
+
+        // Show metadata sync mode
+        let syncMode = metadataSyncMode
+        if syncMode != .none {
+            print("Metadata sync: \(syncMode.rawValue)")
+        }
+
         // Connect to Immich
         let immich = ImmichClient(baseURL: config.immichURL, apiKey: config.immichAPIKey)
         print("Connecting to Immich at \(config.immichURL)...")
@@ -67,21 +106,21 @@ struct ImportCommand: AsyncParsableCommand {
             throw ExitCode.failure
         }
         print("Connected to Immich")
-        
+
         // Load tracker
         let tracker = try Tracker(dbPath: config.trackerDBPath)
         let importedUUIDs = tracker.getImportedUUIDs()
         print("Already imported: \(formatNumber(importedUUIDs.count))")
-        
+
         // Get assets
         print("Loading Photos library...")
         let allAssets = PhotosFetcher.getAllAssets()
         print("Total assets in library: \(formatNumber(allAssets.count))")
-        
+
         // Filter to not-yet-imported
         let candidates = allAssets.filter { !importedUUIDs.contains($0.localIdentifier) }
         print("Not yet imported: \(formatNumber(candidates.count))")
-        
+
         // Filter by local/cloud if needed
         var toImport: [PhotosFetcher.AssetInfo] = []
         if includeCloud || skipLocalCheck {
@@ -100,11 +139,11 @@ struct ImportCommand: AsyncParsableCommand {
             var cloudSkipped = 0
             for (idx, asset) in candidates.enumerated() {
                 if limit > 0 && toImport.count >= limit { break }
-                
+
                 if idx % 100 == 0 && idx > 0 {
                     print("  Checked \(idx)/\(candidates.count)...")
                 }
-                
+
                 if PhotosFetcher.isAssetLocal(asset.localIdentifier) {
                     toImport.append(asset)
                 } else {
@@ -120,27 +159,30 @@ struct ImportCommand: AsyncParsableCommand {
                 print("Skipping \(formatNumber(cloudSkipped)) assets in iCloud (use --include-cloud to download)")
             }
         }
-        
+
         print("Assets to import: \(formatNumber(toImport.count))")
-        
+
         if toImport.isEmpty {
             print("Nothing to import.")
             return
         }
-        
+
         print()
         print(String(repeating: "=", count: 50))
         print("IMPORTING \(formatNumber(toImport.count)) ASSETS (concurrency: \(concurrency))")
         print(String(repeating: "=", count: 50))
         print()
-        
+
         let stats = ImportStatsActor()
         let totalCount = toImport.count
-        
+
+        // Track successfully imported assets for favorites sync
+        let importedAssetsActor = ImportedAssetsActor()
+
         if concurrency <= 1 {
             // Sequential processing (original behavior)
             for (index, asset) in toImport.enumerated() {
-                await processAsset(
+                let result = await processAsset(
                     asset: asset,
                     index: index,
                     total: totalCount,
@@ -151,7 +193,17 @@ struct ImportCommand: AsyncParsableCommand {
                     dryRun: dryRun,
                     allowNetwork: includeCloud
                 )
-                
+
+                // Track for favorites sync if upload succeeded
+                if let immichId = result.immichId {
+                    await importedAssetsActor.add(
+                        uuid: asset.localIdentifier,
+                        immichId: immichId,
+                        isFavorite: asset.isFavorite,
+                        filename: asset.filename
+                    )
+                }
+
                 // Delay between iCloud downloads
                 if index < toImport.count - 1 && delay > 0 {
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
@@ -159,10 +211,10 @@ struct ImportCommand: AsyncParsableCommand {
             }
         } else {
             // Concurrent processing
-            await withTaskGroup(of: Void.self) { group in
+            await withTaskGroup(of: ProcessAssetResult.self) { group in
                 var inFlight = 0
                 var nextIndex = 0
-                
+
                 while nextIndex < toImport.count {
                     // Add tasks up to concurrency limit
                     while inFlight < concurrency && nextIndex < toImport.count {
@@ -170,9 +222,9 @@ struct ImportCommand: AsyncParsableCommand {
                         let index = nextIndex
                         nextIndex += 1
                         inFlight += 1
-                        
+
                         group.addTask {
-                            await self.processAsset(
+                            let result = await self.processAsset(
                                 asset: asset,
                                 index: index,
                                 total: totalCount,
@@ -183,24 +235,70 @@ struct ImportCommand: AsyncParsableCommand {
                                 dryRun: self.dryRun,
                                 allowNetwork: self.includeCloud
                             )
-                            
+
                             // Small delay per task to be gentle on iCloud
                             if self.delay > 0 {
                                 try? await Task.sleep(nanoseconds: UInt64(self.delay * 1_000_000_000))
                             }
+
+                            return ProcessAssetResult(
+                                uuid: asset.localIdentifier,
+                                immichId: result.immichId,
+                                isFavorite: asset.isFavorite,
+                                filename: asset.filename
+                            )
                         }
                     }
-                    
+
                     // Wait for one to complete before adding more
-                    await group.next()
-                    inFlight -= 1
+                    if let result = await group.next() {
+                        inFlight -= 1
+                        if let immichId = result.immichId {
+                            await importedAssetsActor.add(
+                                uuid: result.uuid,
+                                immichId: immichId,
+                                isFavorite: result.isFavorite,
+                                filename: result.filename
+                            )
+                        }
+                    }
                 }
-                
+
                 // Wait for remaining tasks
-                for await _ in group {}
+                for await result in group {
+                    if let immichId = result.immichId {
+                        await importedAssetsActor.add(
+                            uuid: result.uuid,
+                            immichId: immichId,
+                            isFavorite: result.isFavorite,
+                            filename: result.filename
+                        )
+                    }
+                }
             }
         }
-        
+
+        // Favorites sync after import (if enabled)
+        var favoritesSyncSummary: FavoritesSyncService.SyncSummary?
+        if syncMode == .favorites || syncMode == .all {
+            let importedAssets = await importedAssetsActor.getAssets()
+            if !importedAssets.isEmpty {
+                print()
+                if dryRun {
+                    print("DRY RUN: Preview of favorites sync for \(formatNumber(importedAssets.count)) assets...")
+                } else {
+                    print("Syncing favorites for \(formatNumber(importedAssets.count)) imported assets...")
+                }
+
+                favoritesSyncSummary = await FavoritesSyncService.syncFavoritesForImportedAssets(
+                    importedAssets: importedAssets,
+                    immichClient: immich,
+                    tracker: tracker,
+                    dryRun: dryRun
+                )
+            }
+        }
+
         // Summary
         let finalStats = await stats.getStats()
         print()
@@ -220,29 +318,69 @@ struct ImportCommand: AsyncParsableCommand {
         if dryRun {
             print("Skipped:    \(formatNumber(finalStats.skipped)) (dry run)")
         }
-        
+
+        // Print favorites sync summary
+        if let summary = favoritesSyncSummary {
+            print()
+            if summary.isDryRun {
+                print("Favorites Sync Preview (DRY RUN):")
+                if !summary.previewItems.isEmpty {
+                    print("  Would sync \(formatNumber(summary.previewItems.count)) favorites:")
+                    for item in summary.previewItems.prefix(20) {
+                        let name = item.filename ?? item.uuid
+                        let favIcon = item.toFavorite ? "❤️" : "🤍"
+                        print("    \(favIcon) \(name) - \(item.action.rawValue)")
+                    }
+                    if summary.previewItems.count > 20 {
+                        print("    ... and \(formatNumber(summary.previewItems.count - 20)) more")
+                    }
+                }
+                print()
+                print("  Summary (would sync):")
+                print("    Photos -> Immich: \(formatNumber(summary.photosToImmich))")
+                if summary.immichToPhotos > 0 {
+                    print("    Immich -> Photos: \(formatNumber(summary.immichToPhotos))")
+                }
+                if summary.noChange > 0 {
+                    print("    No change: \(formatNumber(summary.noChange))")
+                }
+            } else {
+                print("Favorites Sync:")
+                print("  Photos -> Immich: \(formatNumber(summary.photosToImmich))")
+                if summary.immichToPhotos > 0 {
+                    print("  Immich -> Photos: \(formatNumber(summary.immichToPhotos))")
+                }
+                if summary.conflictsResolved > 0 {
+                    print("  Conflicts resolved: \(formatNumber(summary.conflictsResolved))")
+                }
+                if summary.failures > 0 {
+                    print("  Failed: \(formatNumber(summary.failures))")
+                }
+            }
+        }
+
         let trackerStats = tracker.getStats()
         print()
         print("Total in Immich: \(formatNumber(trackerStats.total)) (\(formatBytes(trackerStats.totalBytes)))")
     }
-    
+
     /// Repair mode: Find Live Photos imported without motion video and re-upload them properly
     private func runRepairMode() async throws {
         print("Requesting Photos access...")
         guard await PhotosFetcher.requestAccess() else {
-            print("ERROR: Photos access denied. Grant access in System Settings → Privacy → Photos")
+            print("ERROR: Photos access denied. Grant access in System Settings -> Privacy -> Photos")
             throw ExitCode.failure
         }
-        
+
         guard let config = Config.load(dryRun: dryRun) else {
             throw ExitCode.failure
         }
-        
+
         if dryRun {
             print("DRY RUN MODE - No changes will be made")
             print()
         }
-        
+
         // Connect to Immich
         let immich = ImmichClient(baseURL: config.immichURL, apiKey: config.immichAPIKey)
         print("Connecting to Immich at \(config.immichURL)...")
@@ -251,10 +389,10 @@ struct ImportCommand: AsyncParsableCommand {
             throw ExitCode.failure
         }
         print("Connected to Immich")
-        
+
         // Load tracker
         let tracker = try Tracker(dbPath: config.trackerDBPath)
-        
+
         // Get stats on paired video assets
         let pairedVideoStats = tracker.getPairedVideoStats()
         print()
@@ -263,20 +401,20 @@ struct ImportCommand: AsyncParsableCommand {
         print("  With motion video: \(formatNumber(pairedVideoStats.withMotionVideo))")
         print("  Needing repair:    \(formatNumber(pairedVideoStats.needingRepair))")
         print()
-        
+
         // Get assets needing paired video repair
         let needingRepair = tracker.getAssetsNeedingPairedVideoRepair()
-        
+
         if needingRepair.isEmpty {
             print("No assets with paired video need repair.")
             return
         }
-        
+
         // Get all Photos library assets to cross-reference
         print("Loading Photos library to find assets with paired video...")
         let allAssets = PhotosFetcher.getAllAssets()
         let assetMap = Dictionary(uniqueKeysWithValues: allAssets.map { ($0.localIdentifier, $0) })
-        
+
         // Filter to only those that actually have paired video in the library
         var toRepair: [(info: Tracker.PairedVideoRepairInfo, asset: PhotosFetcher.AssetInfo)] = []
         for info in needingRepair {
@@ -284,7 +422,7 @@ struct ImportCommand: AsyncParsableCommand {
                 // Asset no longer in library, skip
                 continue
             }
-            
+
             if asset.hasPairedVideo {
                 // Skip Cinematic for now
                 if asset.isCinematic {
@@ -298,39 +436,39 @@ struct ImportCommand: AsyncParsableCommand {
                 }
             }
         }
-        
+
         // Apply limit
         if limit > 0 && toRepair.count > limit {
             toRepair = Array(toRepair.prefix(limit))
         }
-        
+
         print("Assets with paired video to repair: \(formatNumber(toRepair.count))")
-        
+
         if toRepair.isEmpty {
             print("No assets with paired video need repair after verification.")
             return
         }
-        
+
         print()
         print(String(repeating: "=", count: 50))
         print("REPAIRING \(formatNumber(toRepair.count)) PAIRED VIDEO ASSETS")
         print(String(repeating: "=", count: 50))
         print()
-        
+
         var repaired = 0
         var failed = 0
         var skipped = 0
-        
+
         for (index, item) in toRepair.enumerated() {
             let num = index + 1
             print("[\(num)/\(toRepair.count)] \(item.info.filename)")
-            
+
             if dryRun {
                 print("  DRY RUN: Would repair paired video asset")
                 skipped += 1
                 continue
             }
-            
+
             // Check if asset has paired video resource
             guard PhotosFetcher.hasPairedVideoResource(identifier: item.info.uuid) else {
                 print("  WARNING: No paired video in Photos library")
@@ -339,7 +477,7 @@ struct ImportCommand: AsyncParsableCommand {
                 skipped += 1
                 continue
             }
-            
+
             // Download just the video component
             print("  Exporting motion video...")
             let videoResult = await downloadPairedVideoOnly(
@@ -347,18 +485,18 @@ struct ImportCommand: AsyncParsableCommand {
                 to: config.stagingDir,
                 allowNetwork: includeCloud
             )
-            
+
             guard videoResult.success, let videoURL = videoResult.fileURL else {
                 print("  ERROR: \(videoResult.error ?? "Video export failed")")
                 failed += 1
                 continue
             }
-            
+
             print("  Video exported: \(formatBytes(videoResult.fileSize))")
-            
+
             // Get dates
             let dates = PhotosFetcher.getAssetDates(identifier: item.info.uuid)
-            
+
             // Upload video
             let videoDeviceID = "\(item.info.uuid)_video"
             let videoUploadResult = await immich.uploadAsset(
@@ -367,22 +505,22 @@ struct ImportCommand: AsyncParsableCommand {
                 fileCreatedAt: dates.created,
                 fileModifiedAt: dates.modified
             )
-            
+
             // Clean up video staging file
             try? FileManager.default.removeItem(at: videoURL)
-            
+
             guard videoUploadResult.success, let videoImmichID = videoUploadResult.assetID else {
                 print("  ERROR: Video upload failed: \(videoUploadResult.error ?? "unknown")")
                 failed += 1
                 continue
             }
-            
+
             if videoUploadResult.duplicate {
                 print("  Video: duplicate in Immich")
             } else {
                 print("  Video uploaded: \(videoImmichID)")
             }
-            
+
             // Now we need to re-upload the image linked to the video
             // First, delete the old image from Immich (if it exists)
             if let oldImmichID = item.info.immichID {
@@ -395,7 +533,7 @@ struct ImportCommand: AsyncParsableCommand {
                     // Continue anyway - we'll upload a new linked version
                 }
             }
-            
+
             // Export and upload the image again, this time linked to the video
             print("  Exporting image...")
             let imageResult = await PhotosFetcher.downloadAsset(
@@ -403,15 +541,15 @@ struct ImportCommand: AsyncParsableCommand {
                 to: config.stagingDir,
                 allowNetwork: includeCloud
             )
-            
+
             guard imageResult.success, let imageURL = imageResult.fileURL else {
                 print("  ERROR: Image export failed: \(imageResult.error ?? "unknown")")
                 failed += 1
                 continue
             }
-            
+
             print("  Image exported: \(formatBytes(imageResult.fileSize))")
-            
+
             // Upload image linked to video
             let imageUploadResult = await immich.uploadAsset(
                 fileURL: imageURL,
@@ -420,13 +558,13 @@ struct ImportCommand: AsyncParsableCommand {
                 fileModifiedAt: dates.modified,
                 livePhotoVideoId: videoImmichID
             )
-            
+
             // Clean up image staging file
             try? FileManager.default.removeItem(at: imageURL)
-            
+
             if imageUploadResult.success {
                 print("  Image uploaded: \(imageUploadResult.assetID ?? "unknown") (linked to video)")
-                
+
                 // Update tracker with the new info
                 let subtypes = Tracker.AssetSubtypes(
                     isLivePhoto: item.asset.isLivePhoto,
@@ -455,13 +593,13 @@ struct ImportCommand: AsyncParsableCommand {
                 print("  ERROR: Image upload failed: \(imageUploadResult.error ?? "unknown")")
                 failed += 1
             }
-            
+
             // Delay between repairs
             if index < toRepair.count - 1 && delay > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
         }
-        
+
         // Summary
         print()
         print(String(repeating: "=", count: 50))
@@ -473,7 +611,7 @@ struct ImportCommand: AsyncParsableCommand {
             print("Skipped:  \(formatNumber(skipped)) (dry run)")
         }
     }
-    
+
     /// Download just the paired video component of a Live Photo (wrapper for repair mode)
     private func downloadPairedVideoOnly(
         identifier: String,
@@ -487,12 +625,12 @@ struct ImportCommand: AsyncParsableCommand {
             to: stagingDir,
             allowNetwork: allowNetwork
         )
-        
+
         // Clean up the image file if it was exported
         if let imageURL = result.imageResult.fileURL {
             try? FileManager.default.removeItem(at: imageURL)
         }
-        
+
         // Return the video result
         if let videoResult = result.videoResult {
             return videoResult
@@ -507,7 +645,12 @@ struct ImportCommand: AsyncParsableCommand {
             )
         }
     }
-    
+
+    /// Result of processing an asset
+    private struct ProcessAssetResultInternal {
+        let immichId: String?
+    }
+
     private func processAsset(
         asset: PhotosFetcher.AssetInfo,
         index: Int,
@@ -518,7 +661,7 @@ struct ImportCommand: AsyncParsableCommand {
         stats: ImportStatsActor,
         dryRun: Bool,
         allowNetwork: Bool
-    ) async {
+    ) async -> ProcessAssetResultInternal {
         let num = index + 1
         var labels: [String] = []
         if asset.isLivePhoto { labels.append("Live") }
@@ -529,21 +672,22 @@ struct ImportCommand: AsyncParsableCommand {
         if asset.isSpatialVideo { labels.append("Spatial") }
         if asset.isProRAW { labels.append("ProRAW") }
         if asset.hasPairedVideo && !asset.isLivePhoto { labels.append("PairedVideo") }
+        if asset.isFavorite { labels.append("Fav") }
         let labelStr = labels.isEmpty ? "" : " [\(labels.joined(separator: ", "))]"
         print("[\(num)/\(total)] \(asset.filename)\(labelStr)")
-        
+
         if dryRun {
             print("  DRY RUN: Would download and upload")
             await stats.incrementSkipped()
-            return
+            return ProcessAssetResultInternal(immichId: nil)
         }
-        
+
         // Get dates upfront
         let dates = PhotosFetcher.getAssetDates(identifier: asset.localIdentifier)
-        
+
         // Handle Cinematic videos with multi-resource export
         if asset.isCinematic {
-            await processCinematicVideo(
+            return await processCinematicVideo(
                 asset: asset,
                 dates: dates,
                 config: config,
@@ -552,12 +696,11 @@ struct ImportCommand: AsyncParsableCommand {
                 stats: stats,
                 allowNetwork: allowNetwork
             )
-            return
         }
-        
+
         // Handle assets with paired video (Live Photos, etc.) with two-step upload
         if asset.hasPairedVideo {
-            await processPairedAsset(
+            return await processPairedAsset(
                 asset: asset,
                 dates: dates,
                 config: config,
@@ -566,22 +709,21 @@ struct ImportCommand: AsyncParsableCommand {
                 stats: stats,
                 allowNetwork: allowNetwork
             )
-            return
         }
-        
+
         // Standard asset processing (non-Live Photo)
         if allowNetwork {
             print("  Downloading from iCloud...")
         } else {
             print("  Exporting...")
         }
-        
+
         let downloadResult = await PhotosFetcher.downloadAsset(
             identifier: asset.localIdentifier,
             to: config.stagingDir,
             allowNetwork: allowNetwork
         )
-        
+
         if !downloadResult.success {
             let reason = downloadResult.error ?? "Download failed"
             print("  ERROR: \(reason)")
@@ -593,9 +735,9 @@ struct ImportCommand: AsyncParsableCommand {
                 createdAt: asset.creationDate
             )
             await stats.incrementFailed()
-            return
+            return ProcessAssetResultInternal(immichId: nil)
         }
-        
+
         guard let fileURL = downloadResult.fileURL else {
             let reason = "No file URL returned"
             print("  ERROR: \(reason)")
@@ -607,12 +749,12 @@ struct ImportCommand: AsyncParsableCommand {
                 createdAt: asset.creationDate
             )
             await stats.incrementFailed()
-            return
+            return ProcessAssetResultInternal(immichId: nil)
         }
-        
+
         await stats.incrementExported()
         print("  Exported: \(formatBytes(downloadResult.fileSize))")
-        
+
         // Upload to Immich
         let uploadResult = await immich.uploadAsset(
             fileURL: fileURL,
@@ -620,10 +762,10 @@ struct ImportCommand: AsyncParsableCommand {
             fileCreatedAt: dates.created,
             fileModifiedAt: dates.modified
         )
-        
+
         // Clean up staging file
         try? FileManager.default.removeItem(at: fileURL)
-        
+
         if uploadResult.success {
             if uploadResult.duplicate {
                 print("  Duplicate in Immich")
@@ -632,7 +774,7 @@ struct ImportCommand: AsyncParsableCommand {
                 print("  Uploaded: \(uploadResult.assetID ?? "unknown")")
                 await stats.incrementUploaded()
             }
-            
+
             // Track as imported with all subtype info
             let subtypes = Tracker.AssetSubtypes(
                 isLivePhoto: asset.isLivePhoto,
@@ -656,6 +798,7 @@ struct ImportCommand: AsyncParsableCommand {
                 subtypes: subtypes,
                 motionVideoImmichID: nil
             )
+            return ProcessAssetResultInternal(immichId: uploadResult.assetID)
         } else {
             let reason = uploadResult.error ?? "Upload failed"
             print("  ERROR: \(reason)")
@@ -667,9 +810,10 @@ struct ImportCommand: AsyncParsableCommand {
                 createdAt: asset.creationDate
             )
             await stats.incrementFailed()
+            return ProcessAssetResultInternal(immichId: nil)
         }
     }
-    
+
     /// Process an asset with paired video - uploads video first, then image linked to video
     /// Works for Live Photos and other assets with .pairedVideo resource
     private func processPairedAsset(
@@ -680,17 +824,17 @@ struct ImportCommand: AsyncParsableCommand {
         tracker: Tracker,
         stats: ImportStatsActor,
         allowNetwork: Bool
-    ) async {
+    ) async -> ProcessAssetResultInternal {
         let assetType = asset.isLivePhoto ? "Live Photo" : "paired asset"
         print("  Exporting \(assetType) (image + video)...")
-        
+
         // Download both image and video
         let livePhotoResult = await PhotosFetcher.downloadPairedAsset(
             identifier: asset.localIdentifier,
             to: config.stagingDir,
             allowNetwork: allowNetwork
         )
-        
+
         // Check if image export succeeded
         if !livePhotoResult.success {
             let reason = livePhotoResult.imageResult.error ?? "Image export failed"
@@ -703,9 +847,9 @@ struct ImportCommand: AsyncParsableCommand {
                 createdAt: asset.creationDate
             )
             await stats.incrementFailed()
-            return
+            return ProcessAssetResultInternal(immichId: nil)
         }
-        
+
         guard let imageURL = livePhotoResult.imageResult.fileURL else {
             let reason = "No image file URL returned"
             print("  ERROR: \(reason)")
@@ -717,18 +861,18 @@ struct ImportCommand: AsyncParsableCommand {
                 createdAt: asset.creationDate
             )
             await stats.incrementFailed()
-            return
+            return ProcessAssetResultInternal(immichId: nil)
         }
-        
+
         await stats.incrementExported()
         print("  Image exported: \(formatBytes(livePhotoResult.imageResult.fileSize))")
-        
+
         var motionVideoImmichID: String? = nil
-        
+
         // Step 1: Upload the motion video first (if available)
         if livePhotoResult.hasVideo, let videoResult = livePhotoResult.videoResult, let videoURL = videoResult.fileURL {
             print("  Video exported: \(formatBytes(videoResult.fileSize))")
-            
+
             // Upload video with special device asset ID
             let videoDeviceID = "\(asset.localIdentifier)_video"
             let videoUploadResult = await immich.uploadAsset(
@@ -737,10 +881,10 @@ struct ImportCommand: AsyncParsableCommand {
                 fileCreatedAt: dates.created,
                 fileModifiedAt: dates.modified
             )
-            
+
             // Clean up video staging file
             try? FileManager.default.removeItem(at: videoURL)
-            
+
             if videoUploadResult.success {
                 motionVideoImmichID = videoUploadResult.assetID
                 if videoUploadResult.duplicate {
@@ -761,7 +905,7 @@ struct ImportCommand: AsyncParsableCommand {
                 print("  WARNING: No paired video found")
             }
         }
-        
+
         // Step 2: Upload the image, linked to video if available
         let imageUploadResult = await immich.uploadAsset(
             fileURL: imageURL,
@@ -770,10 +914,10 @@ struct ImportCommand: AsyncParsableCommand {
             fileModifiedAt: dates.modified,
             livePhotoVideoId: motionVideoImmichID
         )
-        
+
         // Clean up image staging file
         try? FileManager.default.removeItem(at: imageURL)
-        
+
         if imageUploadResult.success {
             if imageUploadResult.duplicate {
                 print("  Image: duplicate in Immich")
@@ -784,7 +928,7 @@ struct ImportCommand: AsyncParsableCommand {
                 await stats.incrementUploaded()
                 await stats.incrementPairedAssets()
             }
-            
+
             // Track as imported with all subtype info
             let subtypes = Tracker.AssetSubtypes(
                 isLivePhoto: asset.isLivePhoto,
@@ -808,6 +952,7 @@ struct ImportCommand: AsyncParsableCommand {
                 subtypes: subtypes,
                 motionVideoImmichID: motionVideoImmichID
             )
+            return ProcessAssetResultInternal(immichId: imageUploadResult.assetID)
         } else {
             let reason = imageUploadResult.error ?? "Image upload failed"
             print("  ERROR: \(reason)")
@@ -819,9 +964,10 @@ struct ImportCommand: AsyncParsableCommand {
                 createdAt: asset.creationDate
             )
             await stats.incrementFailed()
+            return ProcessAssetResultInternal(immichId: nil)
         }
     }
-    
+
     /// Process a Cinematic video - uploads main video and preserves sidecars
     private func processCinematicVideo(
         asset: PhotosFetcher.AssetInfo,
@@ -831,7 +977,7 @@ struct ImportCommand: AsyncParsableCommand {
         tracker: Tracker,
         stats: ImportStatsActor,
         allowNetwork: Bool
-    ) async {
+    ) async -> ProcessAssetResultInternal {
         print("  Exporting Cinematic video (video + sidecars)...")
 
         // Download all resources (main video + sidecars)
@@ -853,7 +999,7 @@ struct ImportCommand: AsyncParsableCommand {
                 createdAt: asset.creationDate
             )
             await stats.incrementFailed()
-            return
+            return ProcessAssetResultInternal(immichId: nil)
         }
 
         guard let videoURL = cinematicResult.videoResult.fileURL else {
@@ -867,7 +1013,7 @@ struct ImportCommand: AsyncParsableCommand {
                 createdAt: asset.creationDate
             )
             await stats.incrementFailed()
-            return
+            return ProcessAssetResultInternal(immichId: nil)
         }
 
         await stats.incrementExported()
@@ -953,6 +1099,7 @@ struct ImportCommand: AsyncParsableCommand {
                 motionVideoImmichID: nil,
                 cinematicSidecars: sidecarFilenames.isEmpty ? nil : sidecarFilenames
             )
+            return ProcessAssetResultInternal(immichId: uploadResult.assetID)
         } else {
             let reason = uploadResult.error ?? "Video upload failed"
             print("  ERROR: \(reason)")
@@ -964,6 +1111,7 @@ struct ImportCommand: AsyncParsableCommand {
                 createdAt: asset.creationDate
             )
             await stats.incrementFailed()
+            return ProcessAssetResultInternal(immichId: nil)
         }
     }
 
@@ -971,7 +1119,7 @@ struct ImportCommand: AsyncParsableCommand {
     private func runCinematicRepairMode() async throws {
         print("Requesting Photos access...")
         guard await PhotosFetcher.requestAccess() else {
-            print("ERROR: Photos access denied. Grant access in System Settings → Privacy → Photos")
+            print("ERROR: Photos access denied. Grant access in System Settings -> Privacy -> Photos")
             throw ExitCode.failure
         }
 
@@ -1136,13 +1284,13 @@ struct ImportCommand: AsyncParsableCommand {
         formatter.numberStyle = .decimal
         return formatter.string(from: NSNumber(value: n)) ?? "\(n)"
     }
-    
+
     private func formatBytes(_ bytes: Int64) -> String {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
         return formatter.string(fromByteCount: bytes)
     }
-    
+
     private func mediaTypeString(_ type: PHAssetMediaType) -> String {
         switch type {
         case .image: return "photo"
@@ -1151,6 +1299,14 @@ struct ImportCommand: AsyncParsableCommand {
         default: return "unknown"
         }
     }
+}
+
+/// Result of processing an asset for use in concurrent processing
+private struct ProcessAssetResult: Sendable {
+    let uuid: String
+    let immichId: String?
+    let isFavorite: Bool
+    let filename: String
 }
 
 // Thread-safe stats using actor
@@ -1164,7 +1320,7 @@ actor ImportStatsActor {
     private var pairedVideos = 0
     private var cinematicVideos = 0
     private var cinematicSidecars = 0
-    
+
     func incrementExported() { exported += 1 }
     func incrementUploaded() { uploaded += 1 }
     func incrementDuplicates() { duplicates += 1 }
@@ -1174,8 +1330,21 @@ actor ImportStatsActor {
     func incrementPairedVideos() { pairedVideos += 1 }
     func incrementCinematicVideos() { cinematicVideos += 1 }
     func incrementCinematicSidecars() { cinematicSidecars += 1 }
-    
+
     func getStats() -> (exported: Int, uploaded: Int, duplicates: Int, failed: Int, skipped: Int, pairedAssets: Int, pairedVideos: Int, cinematicVideos: Int, cinematicSidecars: Int) {
         (exported, uploaded, duplicates, failed, skipped, pairedAssets, pairedVideos, cinematicVideos, cinematicSidecars)
+    }
+}
+
+/// Actor to collect imported assets for favorites sync
+actor ImportedAssetsActor {
+    private var assets: [(uuid: String, immichId: String, photosIsFavorite: Bool, filename: String)] = []
+
+    func add(uuid: String, immichId: String, isFavorite: Bool, filename: String) {
+        assets.append((uuid: uuid, immichId: immichId, photosIsFavorite: isFavorite, filename: filename))
+    }
+
+    func getAssets() -> [(uuid: String, immichId: String, photosIsFavorite: Bool, filename: String?)] {
+        return assets.map { (uuid: $0.uuid, immichId: $0.immichId, photosIsFavorite: $0.photosIsFavorite, filename: $0.filename as String?) }
     }
 }
